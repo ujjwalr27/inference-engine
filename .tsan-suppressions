@@ -1,0 +1,15 @@
+# ThreadSanitizer suppressions.
+# LibTorch and its OpenMP runtime are prebuilt without instrumentation, so TSan cannot see
+# their synchronization and would report races inside them. The engine's own threading lives
+# in src/scheduler/, which is instrumented and deliberately not suppressed here.
+#
+# Each called_from_lib pattern must match exactly ONE loaded library: a pattern matching
+# several (e.g. plain "libtorch", which also matches libtorch_cpu.so) makes TSan exit with
+# an error before any test runs.
+called_from_lib:libtorch.so
+called_from_lib:libtorch_cpu.so
+called_from_lib:libc10.so
+called_from_lib:libgomp.so
+race:^caffe2::
+race:^at::
+race:^c10::

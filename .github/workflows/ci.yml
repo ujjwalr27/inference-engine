@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  LIBTORCH_VERSION: 2.10.0
+
+jobs:
+  build-test-cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Cache LibTorch
+        id: cache-libtorch
+        uses: actions/cache@v4
+        with:
+          path: ~/libtorch
+          key: libtorch-${{ env.LIBTORCH_VERSION }}-cpu
+
+      - name: Download LibTorch
+        if: steps.cache-libtorch.outputs.cache-hit != 'true'
+        run: |
+          curl -fL --retry 3 -o /tmp/libtorch.zip \
+            "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip"
+          unzip -q /tmp/libtorch.zip -d ~
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH=$HOME/libtorch
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Hello tensor
+        run: ./build/hello_tensor cpu
+
+  # Threading checks only. The model tests skip themselves (no weights here), which also keeps
+  # TSan away from the prebuilt, uninstrumented LibTorch kernels.
+  tsan-scheduler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Cache LibTorch
+        id: cache-libtorch
+        uses: actions/cache@v4
+        with:
+          path: ~/libtorch
+          key: libtorch-${{ env.LIBTORCH_VERSION }}-cpu
+
+      - name: Download LibTorch
+        if: steps.cache-libtorch.outputs.cache-hit != 'true'
+        run: |
+          curl -fL --retry 3 -o /tmp/libtorch.zip \
+            "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip"
+          unzip -q /tmp/libtorch.zip -d ~
+
+      - name: Configure with ThreadSanitizer
+        run: |
+          cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_PREFIX_PATH=$HOME/libtorch -DGPT2_ENABLE_TSAN=ON
+
+      - name: Build tests
+        run: cmake --build build-tsan --target gpt2_tests -j 4
+
+      - name: Run threading tests under TSan
+        env:
+          GPT2_DATA_DIR: /nonexistent
+          OMP_NUM_THREADS: "1"
+          TSAN_OPTIONS: suppressions=${{ github.workspace }}/.tsan-suppressions halt_on_error=1 second_deadlock_stack=1
+        run: ./build-tsan/gpt2_tests --gtest_filter='TokenChannel.*:RequestQueue.*:Request.*'
