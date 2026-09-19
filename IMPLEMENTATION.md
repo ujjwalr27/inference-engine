@@ -191,7 +191,9 @@ Implemented in `scheduler/scheduler.cpp`:
 On `stop()`: close the queue, fail whatever is still in flight, drain the waiting requests.
 
 ### 6.3 Static policy (baseline for benchmarks)
-Wait until `N` requests or a timeout, left-pad, run the batch to completion, only then admit more. Reuses the Phase 3 padded-batch path (`scheduler/static_batch.cpp`), which already reports the two costs the Phase 7 chart is about: `padding_waste` (share of the padded prompt block that is padding) and `wasted_decode_rows` (row-steps spent on rows that already finished).
+`--policy static` changes only *when* requests run, never what they produce. The scheduler gathers up to `static_batch_size` requests (waiting at most `static_max_wait` so a trickle still runs), admits them together, and **admits nothing more until every one of them has finished**. A request arriving one step too late waits for the whole batch; a request that finishes early leaves its slot idle. That is the cost continuous batching removes, and both policies share the same model, cache and decode path, so a comparison measures scheduling alone.
+
+`scheduler/static_batch.cpp` remains the offline padded-batch path, and reports the other two costs: `padding_waste` and `wasted_decode_rows`.
 
 **Padded cache layout.** Static batching keeps rows in their padded form inside the cache, so a token's cache column is no longer its position id. Two things follow, and they are why the model has a separate `decode_padded`:
 - `positions` (for the position embedding) comes from `cumsum(mask) - 1`; `cache_index` is the shared column `T + step`.

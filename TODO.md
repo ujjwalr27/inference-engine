@@ -146,7 +146,8 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 - [x] Stop conditions: EOS, max tokens, context full, cancelled
 - [x] Graceful shutdown: fails in-flight requests, drains the queue (works whether or not it was started)
 - [x] `SchedulerStats`: submitted/rejected/admitted/finished/cancelled, decode steps, tokens, max batch
-- [ ] Policy interface (continuous vs static in one server) — Phase 5, when the server picks one
+- [x] Policy switch: `--policy continuous|static` (+ `--static-batch`, `--static-wait`), reported in `/stats`,
+      with tests that static produces the same answers and that late arrivals wait for the next batch
 
 ### Tests
 - [x] **100 staggered requests** from 12 client threads, random prompts and lengths → every output identical to its solo run (max batch 6/6, 887 tokens in 135 decode steps = 6.6 tokens/step)
@@ -175,7 +176,7 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 - [x] `GET /health`, `GET /stats` (scheduler counters)
 - [x] Per-thread tokenizer (`thread_local`), so the scheduler thread only sees token IDs
 - [ ] Sampling: `temperature`, `top_k` (on device, seeded); tests stay greedy — deferred to Phase 8
-- [ ] Policy switch `--policy continuous|static` for the Phase 7 chart
+- [x] Policy switch `--policy continuous|static` for the Phase 7 chart
 
 ### Load generator
 - [x] `tools/loadgen.cpp`: **open-loop** Poisson arrivals (`--rate --duration --seed`), fires on schedule regardless of outstanding requests
@@ -223,12 +224,13 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 
 ## Phase 7 — Benchmarks (1 week)
 
-Each item is a separate short Kaggle job, 3 repeats, median reported, charts labelled with GPU + vCPU count.
+`scripts/kaggle_sweep.py` runs all four sweeps in one job, each configuration on its own server
+process (started in its own process group, killed afterwards, port checked first).
 
 - [ ] Request-rate sweep → p99 TTFT vs rate (find the knee)
 - [ ] Static vs continuous batching, same load
 - [ ] FP32 vs FP16: tokens/s + peak memory
-- [ ] Slots vs throughput (1, 2, 4, 8, 16, 32, 64)
+- [ ] Slots vs throughput (1, 4, 8, 16, 32)
 - [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
 - [ ] Baseline in a separate job/venv: vLLM (verify T4 support first) or HF `generate` fallback
 - [ ] GPT-2 medium run (bonus, config-driven)
