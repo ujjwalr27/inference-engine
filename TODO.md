@@ -23,7 +23,10 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 
 ### CI
 - [x] `.github/workflows/ci.yml`: ubuntu-latest, cached LibTorch, configure, build, ctest, hello_tensor
-- [ ] Create GitHub repo, push, green tick
+- [x] Repo pushed to https://github.com/ujjwalr27/inference-engine (29 commits, submodule included)
+- [x] First green run: `build-test-cpu` + `tsan-scheduler` both pass
+      (needed one fix: cpp-httplib's optional OpenSSL/zlib/brotli/zstd backends turned off — see IMPLEMENTATION.md §2)
+- [ ] CI currently skips every model test (no weights). Add a job that caches the HF download and runs both scripts
 
 ### Kaggle spike (main risk)
 - [x] Kaggle T4 notebook: torch 2.10.0+cu128, CUDA 12.8, Tesla T4
@@ -205,7 +208,9 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 - [x] Pinned CPU staging buffers for `ids`/`positions`, `non_blocking=true` (allocated once per scheduler)
 - [x] `tools/bench.cpp`: prefill vs prompt length, decode vs batch size at 3 cache lengths, `torch::cuda::synchronize()` around every timed region, CSV out
 - [x] `tests/test_gpu.cpp`: fp32 vs HF (tight), fp16 top-1 agreement + log-prob drift, cached==uncached on GPU, fp16 greedy drift reported, scheduler on GPU vs solo runs — all skip without CUDA
-- [ ] **Run it on Kaggle** (needs a GitHub URL to clone, or upload the repo as a dataset)
+- [ ] **Run it on Kaggle** — now clonable:
+      `!git clone -q --recursive https://github.com/ujjwalr27/inference-engine /kaggle/working/gpt2-engine`
+      then `%run /kaggle/working/gpt2-engine/scripts/kaggle_run.py`
 - [ ] Profile one decode step (kernel launch count, CPU vs GPU time)
 
 **Done when:** the Kaggle job builds, passes GPU tests, and saves a benchmark CSV.

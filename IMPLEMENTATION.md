@@ -69,6 +69,8 @@ Design rules:
 - Kaggle gives **two** T4s: pin the engine to one (`CUDA_VISIBLE_DEVICES=0`) so benchmarks are single-GPU.
 - Only 4 vCPUs on Kaggle: loadgen + server contention is real (see §10).
 
+**Reproducible third-party builds:** cpp-httplib enables OpenSSL, zlib, brotli and zstd whenever it *detects* them, so the build silently depends on what each machine has installed. On GitHub's runners zstd was detected but the imported target it then links (`zstd::libzstd`) was never defined, so configure failed there while succeeding locally. All four are forced off in `CMakeLists.txt`: the engine serves plain local HTTP for benchmarking, and WSL, CI and Kaggle now build identically.
+
 **Repo location:** source stays on the Windows side (`C:\Users\Ujjwal\Desktop\Projects\inference_engine`, i.e. `/mnt/c/...` in WSL); the **build directory lives on the Linux filesystem** (`~/build/gpt2-engine-*`) so compile I/O stays fast. `.gitattributes` forces LF line endings.
 
 **WSL memory:** WSL sees ~6 GB by default, and a torch + GoogleTest translation unit needs ~2 GB to compile, so `scripts/build.sh` defaults to `JOBS=2`. Building with 6 jobs made WSL thrash badly enough to stop responding. Raise `JOBS` only after giving WSL more memory in `%UserProfile%\.wslconfig` (`[wsl2]` → `memory=10GB`).
