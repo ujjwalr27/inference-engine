@@ -46,7 +46,8 @@ std::string runtime_summary() {
   out << "LibTorch " << TORCH_VERSION << ", threads=" << torch::get_num_threads()
       << ", cuda=" << (torch::cuda::is_available() ? "yes" : "no");
   if (torch::cuda::is_available()) {
-    out << " (devices=" << torch::cuda::device_count() << ")";
+    // device_count() returns a narrow integer type that streams as a character, not a number.
+    out << " (devices=" << static_cast<int>(torch::cuda::device_count()) << ")";
   }
   return out.str();
 }

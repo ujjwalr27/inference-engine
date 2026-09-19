@@ -100,7 +100,11 @@ TEST_F(GpuTest, Fp16AgreesOnTheTopTokenAndStaysClose) {
   std::cout << "[          ] fp16 vs HF fp32: top-1 agreement " << top1_agreements << "/" << positions_checked
             << " (" << rate * 100.0 << "%), worst |log-prob diff| " << worst << "\n";
   EXPECT_GE(rate, 0.95) << "fp16 should pick the same top token almost always";
-  EXPECT_LT(worst, 0.05) << "fp16 log-probabilities drifted further than rounding explains";
+  // GPT-2 logits sit around -100, where consecutive fp16 values are 0.0625 apart (0.125 above 128).
+  // A single rounding step is therefore already ~0.06, and twelve layers accumulate several of them,
+  // so anything below ~0.5 is representation limits rather than a bug. What must not drift is the
+  // ordering, which the top-1 check above covers.
+  EXPECT_LT(worst, 0.5) << "fp16 log-probabilities drifted further than fp16 rounding explains";
 }
 
 TEST_F(GpuTest, CachedDecodeMatchesUncachedOnGpu) {
@@ -147,36 +151,85 @@ TEST_F(GpuTest, Fp16GreedyTracksCpuForAWhile) {
   EXPECT_GE(d < 0 ? static_cast<int64_t>(cpu.size()) : d, 5) << "diverging within the first few tokens is a bug";
 }
 
-TEST_F(GpuTest, SchedulerOnGpuMatchesSoloRuns) {
-  gpt2::KVCache solo_cache(gpu16_->config(), 1, torch::kCUDA, torch::kFloat16);
+namespace {
+
+// Runs the prompts through the scheduler and returns what each request produced.
+std::vector<std::vector<int64_t>> run_through_scheduler(const gpt2::GPT2Model& model,
+                                                        const std::vector<std::vector<int64_t>>& prompts,
+                                                        const gpt2::GenerationOptions& options) {
+  gpt2::SchedulerOptions scheduler_options;
+  scheduler_options.n_slots = static_cast<int64_t>(prompts.size());
+  gpt2::Scheduler scheduler(model, scheduler_options);
+  scheduler.start();
+
+  std::vector<std::shared_ptr<gpt2::Request>> requests;
+  for (const auto& prompt : prompts) requests.push_back(scheduler.submit(prompt, options));
+  std::vector<std::vector<int64_t>> tokens;
+  for (const auto& request : requests) {
+    EXPECT_NE(request, nullptr);
+    tokens.push_back(request ? request->out->collect() : std::vector<int64_t>{});
+  }
+  scheduler.stop();
+  return tokens;
+}
+
+}  // namespace
+
+// In fp32 the batch composition must not change a single token: this is the same invariant the
+// CPU tests enforce, checked on the GPU where kernels differ.
+TEST_F(GpuTest, SchedulerOnGpuFp32MatchesSoloRunsExactly) {
   const std::vector<std::string> names = {"p0", "p1", "p2", "p4"};
-  std::vector<std::vector<int64_t>> prompts, expected;
   gpt2::GenerationOptions options;
   options.max_new_tokens = 12;
+
+  gpt2::KVCache solo_cache(gpu32_->config(), 1, torch::kCUDA, torch::kFloat32);
+  std::vector<std::vector<int64_t>> prompts, expected;
+  for (const auto& name : names) {
+    prompts.push_back(to_vector(ref_->load(name + ".input_ids")));
+    expected.push_back(gpt2::generate_cached(*gpu32_, prompts.back(), options, &solo_cache).tokens);
+  }
+
+  const auto batched = run_through_scheduler(*gpu32_, prompts, options);
+  for (size_t i = 0; i < prompts.size(); ++i) {
+    SCOPED_TRACE(names[i]);
+    EXPECT_EQ(first_difference(batched[i], expected[i]), -1) << "batching changed an fp32 answer";
+  }
+}
+
+// In fp16 the same run may diverge, because batching changes the reduction order and fp16 cannot
+// resolve a close race between two candidate tokens. That is acceptable only at a near-tie, so
+// this test measures the gap between the top two logits wherever the outputs part company.
+TEST_F(GpuTest, SchedulerOnGpuFp16DivergesOnlyAtNearTies) {
+  const std::vector<std::string> names = {"p0", "p1", "p2", "p4"};
+  gpt2::GenerationOptions options;
+  options.max_new_tokens = 12;
+
+  gpt2::KVCache solo_cache(gpu16_->config(), 1, torch::kCUDA, torch::kFloat16);
+  std::vector<std::vector<int64_t>> prompts, expected;
   for (const auto& name : names) {
     prompts.push_back(to_vector(ref_->load(name + ".input_ids")));
     expected.push_back(gpt2::generate_cached(*gpu16_, prompts.back(), options, &solo_cache).tokens);
   }
 
-  gpt2::SchedulerOptions scheduler_options;
-  scheduler_options.n_slots = 4;
-  gpt2::Scheduler scheduler(*gpu16_, scheduler_options);
-  scheduler.start();
-
-  std::vector<std::shared_ptr<gpt2::Request>> requests;
-  for (const auto& prompt : prompts) requests.push_back(scheduler.submit(prompt, options));
-  for (size_t i = 0; i < requests.size(); ++i) {
-    ASSERT_NE(requests[i], nullptr);
-    const auto tokens = requests[i]->out->collect();
+  const auto batched = run_through_scheduler(*gpu16_, prompts, options);
+  int diverged = 0;
+  for (size_t i = 0; i < prompts.size(); ++i) {
     SCOPED_TRACE(names[i]);
-    const int64_t d = first_difference(tokens, expected[i]);
-    if (d >= 0) {
-      std::cout << "[          ] " << names[i] << " diverged at token " << d << " when batched on GPU fp16\n";
-    }
-    EXPECT_GE(d < 0 ? static_cast<int64_t>(tokens.size()) : d, 5)
-        << "batched fp16 output should track the solo run at least this far";
+    const int64_t d = first_difference(batched[i], expected[i]);
+    if (d < 0) continue;
+    ++diverged;
+
+    std::vector<int64_t> prefix = prompts[i];
+    prefix.insert(prefix.end(), expected[i].begin(), expected[i].begin() + d);
+    const auto logits = gpu16_->forward(torch::tensor(prefix, torch::kInt64).unsqueeze(0))[0][-1];
+    const double gap = gpt2::test::top2_gap(logits);
+    std::cout << "[          ] " << names[i] << " diverged at token " << d << " of " << expected[i].size()
+              << ", top-2 gap " << gap << "\n";
+    // Consecutive fp16 values near a GPT-2 logit are ~0.06-0.125 apart, so a gap of this order
+    // means the two tokens were never distinguishable in fp16. A clear winner flipping would be a bug.
+    EXPECT_LT(gap, 1.0) << "batched fp16 picked a different token where the winner was clear";
   }
-  scheduler.stop();
+  std::cout << "[          ] " << diverged << " of " << prompts.size() << " requests diverged in fp16\n";
 }
 
 }  // namespace

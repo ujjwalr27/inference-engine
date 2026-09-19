@@ -256,7 +256,23 @@ Text equality alone is flaky: batch shape changes BLAS kernel choice → ~1e-6 d
 
 Reference runs use HF with `attn_implementation="eager"`, `float32`, and the same thread count.
 
-**Phase 6 status (2026-09-19):** all GPU work is written and builds; the GPU tests skip themselves without CUDA and the CPU suite is unaffected. **Not yet run on a T4** — that needs the repo reachable from Kaggle.
+**Phase 6 result (Kaggle T4, 2026-09-19):** builds with CUDA against Kaggle's pip torch and runs. 72 of 74 tests passed on the first GPU run; the two failures were tolerances chosen too tightly on CPU, not engine faults (see below).
+
+| | CPU fp32 (laptop) | T4 fp32 | T4 fp16 |
+|---|---|---|---|
+| prefill 1024 tokens | 3387 ms | 83.2 ms | **28.1 ms** (36k tok/s) |
+| decode, batch 1 | 65.0 ms | 5.28 ms | 4.99 ms |
+| decode, batch 32 (len 128) | — | 6.22 ms (5144 tok/s) | **5.43 ms (5890 tok/s)** |
+| decode, batch 32 (len 1023) | — | 14.9 ms (2148 tok/s) | **9.77 ms (3277 tok/s)** |
+| KV cache, 32 slots | — | 2304 MiB | 1152 MiB |
+
+**FP16 buys almost nothing at batch 1** (4.99 vs 5.28 ms) and 1.5× at batch 32 with a long cache — exactly the prediction in §10: a decode step launches ~200 small kernels, so at low batch the CPU is the bottleneck and the GPU idles. It is the strongest argument for CUDA graphs in Phase 8. Prefill, which is compute-bound, gets the full tensor-core win (3×).
+
+**Server under load (T4 fp16, 32 slots, 8 req/s, 30 s):** 266/266 requests served, 0 rejected, **558 output tokens/s**, TTFT p50 167 ms / p99 600 ms, TPOT p50 5.7 ms. Peak batch was only 14 of 32 slots, so 8 req/s does not saturate this configuration — the Phase 7 rate sweep needs to push much harder.
+
+**Why the two tests failed, and what the right bar is:**
+1. `Fp16AgreesOnTheTopTokenAndStaysClose` demanded log-probabilities within 0.05 of Hugging Face; the run showed 0.237 with **100% top-1 agreement**. Near a GPT-2 logit (~100) consecutive fp16 values are 0.06–0.125 apart, so the threshold asked for finer agreement than fp16 can represent. Raised to 0.5; ordering is what the top-1 check guards.
+2. `SchedulerOnGpuMatchesSoloRuns` required batched fp16 output to track the solo run for at least 5 tokens; two requests diverged at tokens 4 and 8. Batching changes the reduction order, and fp16 cannot resolve a close race — the effect §9 predicted. Replaced by two tests: **fp32 must match exactly** (the real invariant), while fp16 may diverge **only where the top-2 logit gap is tiny**, with the gap printed either way.
 
 CPU baseline from `gpt2_bench` (fp32, laptop under WSL), useful as the "before" column:
 

@@ -208,10 +208,13 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 - [x] Pinned CPU staging buffers for `ids`/`positions`, `non_blocking=true` (allocated once per scheduler)
 - [x] `tools/bench.cpp`: prefill vs prompt length, decode vs batch size at 3 cache lengths, `torch::cuda::synchronize()` around every timed region, CSV out
 - [x] `tests/test_gpu.cpp`: fp32 vs HF (tight), fp16 top-1 agreement + log-prob drift, cached==uncached on GPU, fp16 greedy drift reported, scheduler on GPU vs solo runs — all skip without CUDA
-- [ ] **Run it on Kaggle** — now clonable:
-      `!git clone -q --recursive https://github.com/ujjwalr27/inference-engine /kaggle/working/gpt2-engine`
-      then `%run /kaggle/working/gpt2-engine/scripts/kaggle_run.py`
-- [ ] Profile one decode step (kernel launch count, CPU vs GPU time)
+- [x] **Ran on a Kaggle T4**: CUDA build, 72/74 tests passed, benchmarks + server load CSVs written
+- [x] Needed one fix: Rust is absent on Kaggle, and configuring without it cached `CARGO_EXECUTABLE-NOTFOUND`
+- [x] Retuned two fp16 tolerances that were too strict (see IMPLEMENTATION.md) and split the scheduler GPU
+      test into a strict fp32 one and a near-tie fp16 one
+- [ ] Re-run on Kaggle to confirm 74/74
+- [ ] Profile one decode step (kernel launch count, CPU vs GPU time) — the batch-1 fp16 result says it is launch-bound
+- [ ] Trim the build: SentencePiece and Abseil are compiled but unused (~10 min of the Kaggle build)
 
 **Done when:** the Kaggle job builds, passes GPU tests, and saves a benchmark CSV.
 
