@@ -235,6 +235,74 @@ TEST_F(SchedulerTest, RejectsImpossibleRequests) {
   EXPECT_THROW(scheduler.submit({15496}, gen), std::invalid_argument);
 }
 
+TEST_F(SchedulerTest, ParsesPolicyNames) {
+  EXPECT_EQ(gpt2::parse_policy("continuous"), gpt2::BatchingPolicy::Continuous);
+  EXPECT_EQ(gpt2::parse_policy("static"), gpt2::BatchingPolicy::Static);
+  EXPECT_THROW(gpt2::parse_policy("dynamic"), std::invalid_argument);
+  EXPECT_STREQ(gpt2::to_string(gpt2::BatchingPolicy::Static), "static");
+}
+
+// The static policy must produce the same answers - it only changes when requests run.
+TEST_F(SchedulerTest, StaticPolicyMatchesSoloRuns) {
+  const auto prompt_a = to_vector(ref_->load("p0.input_ids"));
+  const auto prompt_b = to_vector(ref_->load("p4.input_ids"));
+  gpt2::GenerationOptions gen;
+  gen.max_new_tokens = 10;
+
+  gpt2::KVCache solo_cache(model_->config(), 1, model_->device(), model_->dtype());
+  const auto expected_a = solo(prompt_a, gen.max_new_tokens, solo_cache);
+  const auto expected_b = solo(prompt_b, gen.max_new_tokens, solo_cache);
+
+  gpt2::SchedulerOptions options;
+  options.policy = gpt2::BatchingPolicy::Static;
+  options.n_slots = 4;
+  options.static_batch_size = 2;
+  gpt2::Scheduler scheduler(*model_, options);
+  scheduler.start();
+
+  auto a = scheduler.submit(prompt_a, gen);
+  auto b = scheduler.submit(prompt_b, gen);
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  EXPECT_EQ(a->out->collect(), expected_a);
+  EXPECT_EQ(b->out->collect(), expected_b);
+  scheduler.stop();
+  EXPECT_GE(scheduler.stats().batches, 1u);
+}
+
+// The point of the comparison: a request arriving mid-batch waits for the whole batch to finish,
+// where continuous batching would have started it at the next step.
+TEST_F(SchedulerTest, StaticPolicyMakesLateArrivalsWait) {
+  const auto prompt = to_vector(ref_->load("p0.input_ids"));
+  gpt2::GenerationOptions gen;
+  gen.max_new_tokens = 20;
+
+  gpt2::SchedulerOptions options;
+  options.policy = gpt2::BatchingPolicy::Static;
+  options.n_slots = 4;
+  options.static_batch_size = 1;    // first arrival forms a batch on its own
+  options.static_max_wait = std::chrono::milliseconds(1);
+  gpt2::Scheduler scheduler(*model_, options);
+  scheduler.start();
+
+  auto first = scheduler.submit(prompt, gen);
+  ASSERT_NE(first, nullptr);
+  int64_t token = 0;
+  ASSERT_TRUE(first->out->next(token));  // the batch is running
+
+  auto late = scheduler.submit(prompt, gen);  // arrives while the batch is in flight
+  ASSERT_NE(late, nullptr);
+  EXPECT_EQ(scheduler.stats().active, 1) << "a late arrival must not join the running batch";
+
+  const auto first_tokens = first->out->collect();
+  const auto late_tokens = late->out->collect();
+  scheduler.stop();
+
+  EXPECT_EQ(first_tokens.size() + 1, static_cast<size_t>(gen.max_new_tokens));  // one already read
+  EXPECT_EQ(late_tokens.size(), static_cast<size_t>(gen.max_new_tokens));
+  EXPECT_GE(scheduler.stats().batches, 2u) << "the late request should have needed a second batch";
+}
+
 TEST_F(SchedulerTest, StopClosesPendingRequests) {
   gpt2::SchedulerOptions options;
   options.n_slots = 1;

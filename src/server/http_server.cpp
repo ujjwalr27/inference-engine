@@ -189,6 +189,8 @@ void InferenceServer::Impl::install_routes() {
                          {"max_batch", s.max_batch},
                          {"active", s.active},
                          {"queued", s.queued},
+                         {"batches", s.batches},
+                         {"policy", to_string(scheduler.options().policy)},
                          {"slots", scheduler.options().n_slots},
                          {"max_queue", scheduler.options().max_queue}}
                         .dump(),

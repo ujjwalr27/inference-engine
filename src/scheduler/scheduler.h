@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -15,11 +17,29 @@
 
 namespace gpt2 {
 
+enum class BatchingPolicy {
+  // Requests join and leave between decode steps; a free slot is refilled immediately.
+  Continuous,
+  // A batch is formed, run to completion, and only then is the next one admitted. This is the
+  // baseline continuous batching is measured against: a request that arrives one step too late
+  // waits for the whole batch, and a request that finishes early leaves its slot idle.
+  Static,
+};
+
+const char* to_string(BatchingPolicy policy);
+BatchingPolicy parse_policy(const std::string& name);  // throws std::invalid_argument
+
 struct SchedulerOptions {
+  BatchingPolicy policy = BatchingPolicy::Continuous;
   int64_t n_slots = 8;                // concurrent requests held in the KV cache
   size_t max_queue = 64;              // waiting requests before new ones are rejected
   int64_t prefill_budget_tokens = 512;  // prompt tokens admitted per step; caps the decode pause
   std::chrono::milliseconds idle_wait{20};
+
+  // Static policy only: how many requests to gather, and how long to wait for them before
+  // running a smaller batch. 0 means "as many as there are slots".
+  int64_t static_batch_size = 0;
+  std::chrono::milliseconds static_max_wait{50};
 };
 
 struct SchedulerStats {
@@ -33,6 +53,7 @@ struct SchedulerStats {
   int64_t max_batch = 0;    // largest number of slots busy at once
   int64_t active = 0;
   size_t queued = 0;
+  uint64_t batches = 0;     // static policy: batches formed so far
 };
 
 // Continuous batching. One thread owns the model and the KV cache, so nothing else locks them.
@@ -59,6 +80,9 @@ class Scheduler {
  private:
   void run();
   void admit();
+  // How many requests may be admitted right now, and whether the prefill budget applies.
+  // Returns 0 when the policy says to wait.
+  size_t admission_limit(bool& apply_budget);
   void step();
   void finish(size_t index, FinishReason reason);  // publishes, then frees the slot
   void release_slot(size_t index);                 // compacts the last active slot into this one
@@ -80,6 +104,9 @@ class Scheduler {
   // Safe to refill every step because the argmax copy back to the host synchronises first.
   torch::Tensor ids_host_;
   torch::Tensor positions_host_;
+
+  // Static policy: when the current batch started gathering.
+  std::optional<SchedClock::time_point> batch_wait_start_;
 
   mutable std::mutex stats_mutex_;
   SchedulerStats stats_;

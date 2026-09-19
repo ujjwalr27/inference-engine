@@ -3,8 +3,19 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace gpt2 {
+
+const char* to_string(BatchingPolicy policy) {
+  return policy == BatchingPolicy::Static ? "static" : "continuous";
+}
+
+BatchingPolicy parse_policy(const std::string& name) {
+  if (name == "continuous") return BatchingPolicy::Continuous;
+  if (name == "static") return BatchingPolicy::Static;
+  throw std::invalid_argument("policy must be 'continuous' or 'static', got '" + name + "'");
+}
 
 Scheduler::Scheduler(const GPT2Model& model, const SchedulerOptions& options)
     : model_(model),
@@ -70,7 +81,12 @@ void Scheduler::run() {
   while (running_.load()) {
     admit();
     if (active_.empty()) {
-      queue_.wait_for_work(options_.idle_wait);
+      if (queue_.size() == 0) {
+        queue_.wait_for_work(options_.idle_wait);
+      } else {
+        // Static policy gathering a batch: requests are waiting but the policy says not yet.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
       continue;
     }
     step();
@@ -81,11 +97,51 @@ void Scheduler::run() {
   while (auto pending = queue_.try_pop()) pending->out->finish("server shutting down");
 }
 
+size_t Scheduler::admission_limit(bool& apply_budget) {
+  apply_budget = true;
+  const size_t free_slots = static_cast<size_t>(options_.n_slots) - active_.size();
+
+  if (options_.policy == BatchingPolicy::Continuous) {
+    return free_slots;
+  }
+
+  // Static: nothing new joins until the current batch has finished completely.
+  if (!active_.empty()) return 0;
+  const size_t queued = queue_.size();
+  if (queued == 0) {
+    batch_wait_start_.reset();
+    return 0;
+  }
+
+  const size_t target = options_.static_batch_size > 0
+                            ? std::min<size_t>(static_cast<size_t>(options_.static_batch_size), free_slots)
+                            : free_slots;
+  if (queued < target) {
+    // Wait for a full batch, but not forever, or a trickle of requests would never run.
+    if (!batch_wait_start_) {
+      batch_wait_start_ = SchedClock::now();
+      return 0;
+    }
+    if (SchedClock::now() - *batch_wait_start_ < options_.static_max_wait) return 0;
+  }
+  batch_wait_start_.reset();
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    ++stats_.batches;
+  }
+  // The whole batch is prefilled now: applying the per-step budget here would split it in two.
+  apply_budget = false;
+  return std::min(target, queued);
+}
+
 void Scheduler::admit() {
+  bool apply_budget = true;
+  size_t remaining = admission_limit(apply_budget);
   int64_t prefill_tokens = 0;
-  while (static_cast<int64_t>(active_.size()) < options_.n_slots && prefill_tokens < options_.prefill_budget_tokens) {
+  while (remaining > 0 && (!apply_budget || prefill_tokens < options_.prefill_budget_tokens)) {
     auto request = queue_.try_pop();
     if (!request) break;
+    --remaining;
 
     if (request->is_cancelled()) {
       request->finish_reason = FinishReason::Cancelled;

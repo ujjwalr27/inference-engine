@@ -1,6 +1,7 @@
 // Phase 5: HTTP server with token streaming.
 // Usage: gpt2_serve [--weights weights] [--device cpu] [--dtype fp32]
 //                   [--slots 8] [--max-queue 64] [--prefill-budget 512]
+//                   [--policy continuous|static] [--static-batch N] [--static-wait MS]
 //                   [--host 127.0.0.1] [--port 8080] [--threads 0]
 #include <chrono>
 #include <csignal>
@@ -39,6 +40,9 @@ int main(int argc, char** argv) {
       else if (arg == "--slots") scheduler_options.n_slots = std::stoll(next());
       else if (arg == "--max-queue") scheduler_options.max_queue = std::stoul(next());
       else if (arg == "--prefill-budget") scheduler_options.prefill_budget_tokens = std::stoll(next());
+      else if (arg == "--policy") scheduler_options.policy = gpt2::parse_policy(next());
+      else if (arg == "--static-batch") scheduler_options.static_batch_size = std::stoll(next());
+      else if (arg == "--static-wait") scheduler_options.static_max_wait = std::chrono::milliseconds(std::stoll(next()));
       else if (arg == "--host") server_options.host = next();
       else if (arg == "--port") server_options.port = std::stoi(next());
       else if (arg == "--threads") server_options.threads = std::stoul(next());
@@ -65,9 +69,10 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, handle_signal);
 
     const int port = server_options.port == 0 ? server.listen_on_any_port() : server_options.port;
-    std::cout << "serving on http://" << server_options.host << ":" << port << " | slots "
-              << scheduler_options.n_slots << " | queue " << scheduler_options.max_queue << " | prefill budget "
-              << scheduler_options.prefill_budget_tokens << " tokens/step\n"
+    std::cout << "serving on http://" << server_options.host << ":" << port << " | policy "
+              << gpt2::to_string(scheduler_options.policy) << " | slots " << scheduler_options.n_slots << " | queue "
+              << scheduler_options.max_queue << " | prefill budget " << scheduler_options.prefill_budget_tokens
+              << " tokens/step\n"
               << "POST /v1/generate  {\"prompt\": \"...\", \"max_tokens\": 64, \"stream\": true}\n";
 
     if (server_options.port != 0 && !server.listen()) {
