@@ -36,19 +36,31 @@ if(GPT2_ENABLE_TSAN)
 endif()
 
 include(FetchContent)
+FetchContent_Declare(nlohmann_json
+  URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(nlohmann_json)
 
 # Core library (grows each phase)
 add_library(gpt2_core
   src/common/device.cpp
+  src/io/safetensors.cpp
+  src/cache/kv_cache.cpp
+  src/model/config.cpp
+  src/model/layers.cpp
+  src/model/gpt2.cpp
 )
 target_include_directories(gpt2_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(gpt2_core
   PUBLIC ${TORCH_LIBRARIES}
-  PRIVATE gpt2_options)
+  PRIVATE nlohmann_json::nlohmann_json gpt2_options)
 
 # Tools
 add_executable(hello_tensor tools/hello_tensor.cpp)
 target_link_libraries(hello_tensor PRIVATE gpt2_core gpt2_options)
+
+add_executable(gpt2_forward tools/forward.cpp)
+target_link_libraries(gpt2_forward PRIVATE gpt2_core gpt2_options)
 
 # Tests
 if(GPT2_BUILD_TESTS)
@@ -63,8 +75,12 @@ if(GPT2_BUILD_TESTS)
 
   add_executable(gpt2_tests
     tests/test_smoke.cpp
+    tests/test_safetensors.cpp
+    tests/test_layers.cpp
+    tests/test_kv_cache.cpp
+    tests/test_gpt2_reference.cpp
   )
-  target_link_libraries(gpt2_tests PRIVATE gpt2_core gpt2_options GTest::gtest_main)
+  target_link_libraries(gpt2_tests PRIVATE gpt2_core gpt2_options nlohmann_json::nlohmann_json GTest::gtest_main)
   target_compile_definitions(gpt2_tests PRIVATE GPT2_DEFAULT_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/weights")
   gtest_discover_tests(gpt2_tests DISCOVERY_TIMEOUT 60)
 endif()
