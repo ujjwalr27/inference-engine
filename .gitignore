@@ -1,0 +1,11 @@
+build/
+cmake-build-*/
+.venv/
+__pycache__/
+*.pyc
+weights/
+results/raw/
+compile_commands.json
+.cache/
+.vscode/
+.idea/
