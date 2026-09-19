@@ -256,7 +256,9 @@ Text equality alone is flaky: batch shape changes BLAS kernel choice → ~1e-6 d
 
 Reference runs use HF with `attn_implementation="eager"`, `float32`, and the same thread count.
 
-**Phase 6 result (Kaggle T4, 2026-09-19):** builds with CUDA against Kaggle's pip torch and runs. 72 of 74 tests passed on the first GPU run; the two failures were tolerances chosen too tightly on CPU, not engine faults (see below).
+**Phase 6 result (Kaggle T4, 2026-09-19): 75/75 tests pass**, including six GPU tests. The first run failed two of them; both were tolerances guessed on CPU, not engine faults (see below).
+
+**The fp16 divergence question, settled with numbers.** Where batched fp16 output differs from a solo run, the gap between the top two logits at that step was **0** for one request (an exact tie in fp16 — the choice was arbitrary) and **0.0625** for the other, which is exactly one fp16 step at that magnitude. Neither is a scheduling bug; fp32 on the same path matches solo output exactly.
 
 | | CPU fp32 (laptop) | T4 fp32 | T4 fp16 |
 |---|---|---|---|
@@ -268,7 +270,9 @@ Reference runs use HF with `attn_implementation="eager"`, `float32`, and the sam
 
 **FP16 buys almost nothing at batch 1** (4.99 vs 5.28 ms) and 1.5× at batch 32 with a long cache — exactly the prediction in §10: a decode step launches ~200 small kernels, so at low batch the CPU is the bottleneck and the GPU idles. It is the strongest argument for CUDA graphs in Phase 8. Prefill, which is compute-bound, gets the full tensor-core win (3×).
 
-**Server under load (T4 fp16, 32 slots, 8 req/s, 30 s):** 266/266 requests served, 0 rejected, **558 output tokens/s**, TTFT p50 167 ms / p99 600 ms, TPOT p50 5.7 ms. Peak batch was only 14 of 32 slots, so 8 req/s does not saturate this configuration — the Phase 7 rate sweep needs to push much harder.
+**Server under load (T4 fp16, 32 slots, 8 req/s, 30 s):** 266/266 requests served, 0 rejected, **557 output tokens/s**, TTFT p50 83 ms / p99 461 ms, TPOT p50 6.3 ms. Peak batch was only 14 of 32 slots, so 8 req/s does not saturate this configuration — the Phase 7 rate sweep needs to push much harder.
+
+**Benchmark hazard found here:** the second run's `/stats` reported 400 requests when the load generator had sent 266. A server from the previous cell was still alive, and because cpp-httplib sets `SO_REUSEPORT`, the kernel happily split connections between two engines sharing port 8099 — numbers from a mix of two processes, with no error anywhere. Two causes, both fixed in `scripts/kaggle_run.py`: `Popen(shell=True)` meant `terminate()` killed the shell and left the server running, and nothing checked the port first. The script now starts the server without a shell in its own process group, kills the group, refuses to run if the port already answers, and warns when the server's request count disagrees with the load generator's.
 
 **Why the two tests failed, and what the right bar is:**
 1. `Fp16AgreesOnTheTopTokenAndStaysClose` demanded log-probabilities within 0.05 of Hugging Face; the run showed 0.237 with **100% top-1 agreement**. Near a GPT-2 logit (~100) consecutive fp16 values are 0.06–0.125 apart, so the threshold asked for finer agreement than fp16 can represent. Raised to 0.5; ordering is what the top-1 check guards.

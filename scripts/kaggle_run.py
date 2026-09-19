@@ -18,8 +18,10 @@ Everything lands in /kaggle/working/results, which Kaggle keeps as job output.
 Flags: --skip-tests, --skip-bench, --skip-serve, --repo PATH, --jobs N
 """
 import argparse
+import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -89,6 +91,8 @@ def main() -> None:
     ap.add_argument("--fresh", action="store_true", help="discard the build directory first")
     ap.add_argument("--rate", type=float, default=8.0)
     ap.add_argument("--duration", type=float, default=30.0)
+    ap.add_argument("--slots", type=int, default=32)
+    ap.add_argument("--port", type=int, default=8099)
     args = ap.parse_args()
 
     repo = Path(args.repo)
@@ -148,29 +152,50 @@ def main() -> None:
 
     if not args.skip_serve:
         print("\n=== server + open-loop load ===")
+        port = args.port
+        # A server left over from an earlier cell would quietly share the port: cpp-httplib sets
+        # SO_REUSEPORT, so the kernel splits connections between both processes and the numbers
+        # become a mix of two engines. Refuse to measure in that state.
+        if subprocess.run(f"curl -sf http://127.0.0.1:{port}/health", shell=True,
+                          capture_output=True).returncode == 0:
+            raise SystemExit(f"something is already serving on port {port}; restart the kernel or pass --port")
+
         for dtype in ("fp16",):
+            # No shell: with shell=True, terminate() kills the shell and leaves the server running.
             server = subprocess.Popen(
-                f"{build}/gpt2_serve --weights {weights} --device cuda --dtype {dtype} "
-                f"--slots 32 --max-queue 128 --port 8099",
-                shell=True, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                [str(build / "gpt2_serve"), "--weights", str(weights), "--device", "cuda", "--dtype", dtype,
+                 "--slots", str(args.slots), "--max-queue", "128", "--port", str(port)],
+                env=run_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                start_new_session=True,
             )
             try:
                 for _ in range(120):
-                    if subprocess.run("curl -sf http://127.0.0.1:8099/health", shell=True).returncode == 0:
+                    if subprocess.run(f"curl -sf http://127.0.0.1:{port}/health", shell=True,
+                                      capture_output=True).returncode == 0:
                         break
+                    if server.poll() is not None:
+                        raise SystemExit(f"server exited early:\n{server.stdout.read()[-2000:]}")
                     time.sleep(1)
                 else:
                     raise SystemExit("server did not come up")
-                sh(
-                    f"{build}/gpt2_loadgen --url http://127.0.0.1:8099 --rate {args.rate} "
-                    f"--duration {args.duration} --prompt-min 32 --prompt-max 256 --max-tokens 64 "
-                    f"--out {results}/serve_{dtype}_rate{args.rate:g}.csv",
-                    env=run_env,
-                )
-                sh("curl -s http://127.0.0.1:8099/stats", env=run_env)
+
+                csv = results / f"serve_{dtype}_rate{args.rate:g}.csv"
+                sh(f"{build}/gpt2_loadgen --url http://127.0.0.1:{port} --rate {args.rate} "
+                   f"--duration {args.duration} --prompt-min 32 --prompt-max 256 --max-tokens 64 --out {csv}",
+                   env=run_env)
+                stats = sh(f"curl -s http://127.0.0.1:{port}/stats", env=run_env).stdout
+                # The server should have seen exactly the requests the load generator sent.
+                sent = sum(1 for _ in open(csv)) - 1
+                submitted = json.loads(stats).get("submitted", -1)
+                if submitted != sent:
+                    print(f"WARNING: load generator sent {sent} requests but the server counted {submitted}; "
+                          "another server may be sharing the port")
             finally:
-                server.terminate()
-                server.wait(timeout=30)
+                os.killpg(os.getpgid(server.pid), signal.SIGTERM)
+                try:
+                    server.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(server.pid), signal.SIGKILL)
 
     print("\n=== done ===")
     sh(f"ls -la {results}")

@@ -212,7 +212,8 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 - [x] Needed one fix: Rust is absent on Kaggle, and configuring without it cached `CARGO_EXECUTABLE-NOTFOUND`
 - [x] Retuned two fp16 tolerances that were too strict (see IMPLEMENTATION.md) and split the scheduler GPU
       test into a strict fp32 one and a near-tie fp16 one
-- [ ] Re-run on Kaggle to confirm 74/74
+- [x] Re-run on Kaggle: **75/75 pass**; fp16 divergences confirmed as top-2 gaps of 0 and 0.0625
+- [x] Fixed a benchmark hazard: a leftover server shared the port via `SO_REUSEPORT` and silently split the load
 - [ ] Profile one decode step (kernel launch count, CPU vs GPU time) — the batch-1 fp16 result says it is launch-bound
 - [ ] Trim the build: SentencePiece and Abseil are compiled but unused (~10 min of the Kaggle build)
 
