@@ -41,6 +41,11 @@ FetchContent_Declare(nlohmann_json
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(nlohmann_json)
 
+# Hugging Face tokenizers via mlc-ai/tokenizers-cpp (builds the Rust crate with cargo).
+# SentencePiece is not needed for GPT-2's byte-level BPE, so it stays off.
+set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/tokenizers-cpp tokenizers EXCLUDE_FROM_ALL)
+
 # Core library (grows each phase)
 add_library(gpt2_core
   src/common/device.cpp
@@ -49,11 +54,13 @@ add_library(gpt2_core
   src/model/config.cpp
   src/model/layers.cpp
   src/model/gpt2.cpp
+  src/model/generate.cpp
+  src/tokenizer/tokenizer.cpp
 )
 target_include_directories(gpt2_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(gpt2_core
   PUBLIC ${TORCH_LIBRARIES}
-  PRIVATE nlohmann_json::nlohmann_json gpt2_options)
+  PRIVATE nlohmann_json::nlohmann_json tokenizers_cpp gpt2_options)
 
 # Tools
 add_executable(hello_tensor tools/hello_tensor.cpp)
@@ -61,6 +68,9 @@ target_link_libraries(hello_tensor PRIVATE gpt2_core gpt2_options)
 
 add_executable(gpt2_forward tools/forward.cpp)
 target_link_libraries(gpt2_forward PRIVATE gpt2_core gpt2_options)
+
+add_executable(gpt2_generate tools/generate.cpp)
+target_link_libraries(gpt2_generate PRIVATE gpt2_core gpt2_options)
 
 # Tests
 if(GPT2_BUILD_TESTS)
@@ -79,6 +89,8 @@ if(GPT2_BUILD_TESTS)
     tests/test_layers.cpp
     tests/test_kv_cache.cpp
     tests/test_gpt2_reference.cpp
+    tests/test_generate.cpp
+    tests/test_tokenizer.cpp
   )
   target_link_libraries(gpt2_tests PRIVATE gpt2_core gpt2_options nlohmann_json::nlohmann_json GTest::gtest_main)
   target_compile_definitions(gpt2_tests PRIVATE GPT2_DEFAULT_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/weights")
