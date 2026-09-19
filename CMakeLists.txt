@@ -55,6 +55,11 @@ add_library(gpt2_core
   src/model/layers.cpp
   src/model/gpt2.cpp
   src/model/generate.cpp
+  src/scheduler/padding.cpp
+  src/scheduler/static_batch.cpp
+  src/scheduler/request.cpp
+  src/scheduler/queue.cpp
+  src/scheduler/scheduler.cpp
   src/tokenizer/tokenizer.cpp
 )
 target_include_directories(gpt2_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -90,6 +95,9 @@ if(GPT2_BUILD_TESTS)
     tests/test_kv_cache.cpp
     tests/test_gpt2_reference.cpp
     tests/test_generate.cpp
+    tests/test_batch.cpp
+    tests/test_concurrency.cpp
+    tests/test_scheduler.cpp
     tests/test_tokenizer.cpp
   )
   target_link_libraries(gpt2_tests PRIVATE gpt2_core gpt2_options nlohmann_json::nlohmann_json GTest::gtest_main)
