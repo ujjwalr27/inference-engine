@@ -20,6 +20,9 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 from transformers import AutoTokenizer, GPT2LMHeadModel
+from transformers.utils import logging as hf_logging
+
+hf_logging.disable_progress_bar()  # one progress line per tensor is noise in a job log
 
 LONG_SOURCE = (
     "An inference engine turns a trained model into a service. It loads weights once, keeps a cache of "

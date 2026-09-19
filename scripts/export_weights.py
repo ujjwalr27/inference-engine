@@ -27,6 +27,9 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer, GPT2LMHeadModel
+from transformers.utils import logging as hf_logging
+
+hf_logging.disable_progress_bar()  # one progress line per tensor is noise in a job log
 
 
 def export(model: GPT2LMHeadModel) -> dict[str, torch.Tensor]:

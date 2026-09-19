@@ -27,17 +27,42 @@ from pathlib import Path
 
 import torch
 
+# Keep the log readable: these scripts otherwise print a progress bar line per weight tensor.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-def sh(cmd, check=True, env=None, cwd=None, quiet=False):
+
+def sh(cmd, check=True, env=None, cwd=None, quiet=False, tail=4000):
     if not quiet:
         print(f"$ {cmd}", flush=True)
     result = subprocess.run(cmd, shell=True, text=True, capture_output=True, env=env, cwd=cwd)
-    output = (result.stdout + result.stderr).strip()
+    # Progress bars (git, pip, tqdm) redraw with \r and would otherwise bury the real output.
+    lines = [ln.split("\r")[-1] for ln in (result.stdout + result.stderr).splitlines()]
+    output = "\n".join(ln for ln in lines if ln.strip()).strip()
     if output and not quiet:
-        print(output[-8000:], flush=True)
+        print(output[-tail:], flush=True)
     if check and result.returncode != 0:
         raise SystemExit(f"failed ({result.returncode}): {cmd}")
     return result
+
+
+def ensure_rust() -> str:
+    """The tokenizer wraps a Rust crate, and Kaggle images ship without cargo.
+
+    This must run BEFORE cmake configures: a configure done without cargo caches
+    CARGO_EXECUTABLE-NOTFOUND and the build fails much later, in the middle of the tokenizer.
+    """
+    cargo_bin = Path.home() / ".cargo" / "bin"
+    if shutil.which("cargo") is None and not (cargo_bin / "cargo").exists():
+        print("installing Rust (needed by tokenizers-cpp)")
+        sh("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | "
+           "sh -s -- -y --profile minimal --default-toolchain stable", tail=1500)
+    os.environ["PATH"] = f"{cargo_bin}{os.pathsep}{os.environ['PATH']}"
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise SystemExit("cargo still not on PATH after installing Rust")
+    sh(f"{cargo} --version", tail=200)
+    return cargo
 
 
 def environment() -> None:
@@ -61,6 +86,7 @@ def main() -> None:
     ap.add_argument("--skip-tests", action="store_true")
     ap.add_argument("--skip-bench", action="store_true")
     ap.add_argument("--skip-serve", action="store_true")
+    ap.add_argument("--fresh", action="store_true", help="discard the build directory first")
     ap.add_argument("--rate", type=float, default=8.0)
     ap.add_argument("--duration", type=float, default=30.0)
     args = ap.parse_args()
@@ -87,6 +113,12 @@ def main() -> None:
         sh(f"{sys.executable} scripts/reference.py", cwd=repo)
 
     print("\n=== build (CUDA) ===")
+    ensure_rust()
+    # A cache from a run where cargo was missing keeps the not-found path forever.
+    cache = build / "CMakeCache.txt"
+    if args.fresh or (cache.exists() and "CARGO_EXECUTABLE-NOTFOUND" in cache.read_text(errors="ignore")):
+        print(f"discarding stale build directory {build}")
+        shutil.rmtree(build, ignore_errors=True)
     env = dict(os.environ, TORCH_CUDA_ARCH_LIST="7.5")  # T4 is sm_75
     nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
     cuda_args = f"-DCMAKE_CUDA_COMPILER={nvcc}" if Path(nvcc).exists() else ""
