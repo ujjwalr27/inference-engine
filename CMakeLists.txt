@@ -41,6 +41,15 @@ FetchContent_Declare(nlohmann_json
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(nlohmann_json)
 
+# cpp-httplib picks up OpenSSL/zlib/brotli/zstd from the host when it finds them, which makes the
+# build depend on what happens to be installed - and on GitHub's runners zstd is detected without
+# defining the imported target it then links, breaking the configure step. The engine serves plain
+# local HTTP for benchmarking, so every optional backend stays off and all machines build alike.
+set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZSTD_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(cpp_httplib
   URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.27.0.tar.gz
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
