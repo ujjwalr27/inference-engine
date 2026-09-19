@@ -41,6 +41,11 @@ FetchContent_Declare(nlohmann_json
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(nlohmann_json)
 
+FetchContent_Declare(cpp_httplib
+  URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.27.0.tar.gz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(cpp_httplib)
+
 # Hugging Face tokenizers via mlc-ai/tokenizers-cpp (builds the Rust crate with cargo).
 # SentencePiece is not needed for GPT-2's byte-level BPE, so it stays off.
 set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
@@ -61,11 +66,12 @@ add_library(gpt2_core
   src/scheduler/queue.cpp
   src/scheduler/scheduler.cpp
   src/tokenizer/tokenizer.cpp
+  src/server/http_server.cpp
 )
 target_include_directories(gpt2_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(gpt2_core
   PUBLIC ${TORCH_LIBRARIES}
-  PRIVATE nlohmann_json::nlohmann_json tokenizers_cpp gpt2_options)
+  PRIVATE nlohmann_json::nlohmann_json tokenizers_cpp httplib::httplib gpt2_options)
 
 # Tools
 add_executable(hello_tensor tools/hello_tensor.cpp)
@@ -76,6 +82,17 @@ target_link_libraries(gpt2_forward PRIVATE gpt2_core gpt2_options)
 
 add_executable(gpt2_generate tools/generate.cpp)
 target_link_libraries(gpt2_generate PRIVATE gpt2_core gpt2_options)
+
+add_executable(gpt2_bench tools/bench.cpp)
+target_link_libraries(gpt2_bench PRIVATE gpt2_core gpt2_options)
+
+add_executable(gpt2_serve tools/serve.cpp)
+target_link_libraries(gpt2_serve PRIVATE gpt2_core gpt2_options)
+
+# The load generator only speaks HTTP; it deliberately does not link the engine.
+add_executable(gpt2_loadgen tools/loadgen.cpp)
+target_link_libraries(gpt2_loadgen PRIVATE httplib::httplib nlohmann_json::nlohmann_json gpt2_options
+                      Threads::Threads)
 
 # Tests
 if(GPT2_BUILD_TESTS)
@@ -92,15 +109,18 @@ if(GPT2_BUILD_TESTS)
     tests/test_smoke.cpp
     tests/test_safetensors.cpp
     tests/test_layers.cpp
-    tests/test_kv_cache.cpp
     tests/test_gpt2_reference.cpp
+    tests/test_kv_cache.cpp
     tests/test_generate.cpp
     tests/test_batch.cpp
     tests/test_concurrency.cpp
     tests/test_scheduler.cpp
+    tests/test_server.cpp
+    tests/test_gpu.cpp
     tests/test_tokenizer.cpp
   )
-  target_link_libraries(gpt2_tests PRIVATE gpt2_core gpt2_options nlohmann_json::nlohmann_json GTest::gtest_main)
+  target_link_libraries(gpt2_tests PRIVATE gpt2_core gpt2_options nlohmann_json::nlohmann_json httplib::httplib
+                        GTest::gtest_main)
   target_compile_definitions(gpt2_tests PRIVATE GPT2_DEFAULT_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/weights")
   gtest_discover_tests(gpt2_tests DISCOVERY_TIMEOUT 60)
 endif()
