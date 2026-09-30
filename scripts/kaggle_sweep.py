@@ -153,18 +153,13 @@ def main() -> None:
     (results / "sweep_summary.json").write_text(json.dumps(summary, indent=2))
 
     print("\n=== charts ===")
-    plots = repo / "scripts/plot_results.py"
-    sh(f"{sys.executable} {plots} sweep {results}/continuous_rate*.csv --x-from-name "
-       f"--title 'Continuous batching: TTFT vs request rate' --out {results}/ttft_vs_rate_continuous.png",
-       check=False)
-    sh(f"{sys.executable} {plots} sweep {results}/static_rate*.csv --x-from-name "
-       f"--title 'Static batching: TTFT vs request rate' --out {results}/ttft_vs_rate_static.png", check=False)
-    sh(f"{sys.executable} {plots} compare {results}/continuous_rate{args.compare_rate:g}.csv "
-       f"{results}/static_rate{args.compare_rate:g}.csv --out {results}/continuous_vs_static.png", check=False)
-    sh(f"{sys.executable} {plots} compare {results}/dtype_fp32.csv {results}/dtype_fp16.csv "
-       f"--out {results}/fp32_vs_fp16.png", check=False)
-    sh(f"{sys.executable} {plots} compare " + " ".join(f"{results}/slots_{s}.csv" for s in slot_counts) +
-       f" --out {results}/slots_vs_throughput.png", check=False)
+    # The policy comparison is only meaningful below capacity, where both policies keep up and
+    # the difference is latency; saturated, it is mostly queueing. Use the highest rate that
+    # served every request under both policies.
+    below = [s["rate"] for s in summary if s["kind"] == "rate" and s.get("rejected", 0) == 0
+             and s.get("transport_failures", 0) == 0]
+    compare_rate = max((r for r in below if sum(x == r for x in below) == 2), default=rates[0])
+    sh(f"{sys.executable} {repo}/scripts/plot_results.py readme {results} --rate {compare_rate:g}", check=False)
 
     print("\n=== done ===")
     sh(f"ls -la {results}")

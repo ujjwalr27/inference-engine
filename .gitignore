@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 weights/
 results/raw/
+results/local_cpu/
 compile_commands.json
 .cache/
 .vscode/
