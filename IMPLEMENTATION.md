@@ -210,7 +210,8 @@ Continuous batching (§6.2) avoids all of this: each request is prefilled on its
 ## 7. Tokenizer (`src/tokenizer`)
 
 - `tokenizers::Tokenizer::FromBlobJSON(read("weights/tokenizer.json"))`, `Encode`, `Decode`.
-- One instance per HTTP thread (`thread_local`) unless thread safety of a shared handle is verified.
+- **One instance, loaded at server start and shared by every HTTP worker**, with calls serialised by a mutex inside the wrapper: tokenizers-cpp's `Decode` writes its result into a buffer held by the handle and reads it back, so concurrent calls on one handle could swap results. The lock is held for microseconds.
+- It was originally one instance per worker thread (`thread_local`). Loading `tokenizer.json` takes ~200 ms, and with ~300 workers most low-load requests landed on a thread paying that load — the Hugging Face baseline exposed it (see the Phase 7 baseline result).
 - **IncrementalDecoder** for streaming: keep all generated IDs, decode the full list each step, emit only the new suffix; hold back if the text ends in `U+FFFD` (incomplete UTF-8 sequence).
 
 ---
@@ -257,6 +258,19 @@ Text equality alone is flaky: batch shape changes BLAS kernel choice → ~1e-6 d
 | GPU fp16 vs CPU fp32 | log-softmax `atol ≈ 1e-2` (calibrate), top-1 agreement rate reported | divergence position logged, not hidden |
 
 Reference runs use HF with `attn_implementation="eager"`, `float32`, and the same thread count.
+
+**Phase 7 baseline: the engine vs plain Hugging Face (Kaggle T4, fp16, 2026-09-30).** `scripts/hf_server.py` serves `transformers` `generate()` behind the engine's own API, one request at a time; `scripts/kaggle_baseline.py` drives both with the same load generator, seed, prompts (32–256 tokens) and 64-token outputs.
+
+| Load | Engine TTFT p50 | HF TTFT p50 | Engine TPOT p50 | HF TPOT p50 | Engine tok/s | HF tok/s |
+|---|---|---|---|---|---|---|
+| 1 req/s | 143 ms | **18 ms** | 3.6 ms | 9.5 ms | 62 | 59 |
+| 2 req/s | **160 ms** | 1.9 s | 3.7 ms | 9.4 ms | 126 | 104 |
+| 4 req/s | **165 ms** | 13.7 s | 3.9 ms | 9.4 ms | 245 | 106 |
+| 8 req/s | **241 ms** | 42.3 s | 4.1 ms | 9.4 ms | **547** | 105 |
+
+- **Throughput 5.2× at 8 req/s**, about 7× against the engine's measured capacity (~11 req/s). Serial `generate()` saturates at ~1.65 req/s (105 tok/s): 64 tokens × 9.4 ms ≈ 0.6 s per request.
+- **Each token is 2.3–2.6× cheaper even without batching** (3.6–4.1 vs 9.4 ms): `generate()` pays Python-level overhead every step (logits processors, stopping criteria, the streamer); the engine's decode loop is C++.
+- **Hugging Face was faster to the first token at 1 req/s (18 vs 143 ms), and that was an engine bug.** Every HTTP worker thread loaded its own tokenizer on its first request; loading `tokenizer.json` measures 180–260 ms, and with ~300 workers nearly every low-load request paid it. Fixed by sharing one tokenizer (§7). Measured locally at 1 req/s with the same seed: **TTFT p50 617 → 164 ms, p99 951 → 234 ms**. The T4 numbers above predate the fix; a re-run should close most of the 125 ms gap.
 
 **Phase 7, first sweep (Kaggle T4, fp16, 32 slots, 2026-09-30).** 18 configurations, prompts 32–256 tokens, 64 output tokens each. Throughput figures are the load generator's own (see the plotting bug below).
 

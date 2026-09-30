@@ -241,8 +241,10 @@ at 8 req/s, slots scaling. Needs a second pass:
 - [ ] Finer rate sweep around the knee: 4, 6, 8, 10, 12, 14
 - [ ] FP32 vs FP16 below the knee (the saturated comparison was host-bound and meaningless)
 - [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
-- [ ] Baseline: `scripts/hf_server.py` (serial `transformers.generate()` behind our API, fp16) driven by the
-      same load generator via `scripts/kaggle_baseline.py`; tested locally on CPU, not yet run on the T4
+- [x] Baseline vs plain Hugging Face on the T4: 5.2x throughput at 8 req/s, 2.3-2.6x cheaper tokens
+- [x] It exposed an engine bug: per-thread tokenizer loads (~200 ms each) inflated low-load TTFT.
+      Fixed with one shared tokenizer; locally TTFT p50 617 -> 164 ms at 1 req/s
+- [ ] Re-run the baseline on the T4 after the tokenizer fix
 - [ ] vLLM baseline (separate job/venv; verify T4 support first)
 - [ ] GPT-2 medium run (bonus, config-driven)
 - [ ] Commit CSVs + PNGs to `results/<date>_<gpu>/`
