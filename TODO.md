@@ -227,10 +227,19 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 `scripts/kaggle_sweep.py` runs all four sweeps in one job, each configuration on its own server
 process (started in its own process group, killed afterwards, port checked first).
 
-- [ ] Request-rate sweep → p99 TTFT vs rate (find the knee)
-- [ ] Static vs continuous batching, same load
-- [ ] FP32 vs FP16: tokens/s + peak memory
-- [ ] Slots vs throughput (1, 4, 8, 16, 32)
+First sweep done (2026-09-30), results in IMPLEMENTATION.md. Valid: knee ~11 req/s, continuous −40% latency
+at 8 req/s, slots scaling. Needs a second pass:
+
+- [x] Request-rate sweep → knee between 8 and 16 req/s
+- [x] Static vs continuous batching, same load (lower bound only, see below)
+- [x] Slots vs throughput (1, 4, 8, 16, 32)
+- [x] Fix: false "port may be shared" warning (it was counting connection failures)
+- [x] Fix: `plot_results.py` throughput ~30% low (wrong wall-time formula)
+- [ ] Load generator: varied output lengths, so static batching's idle-slot cost is visible
+- [ ] Time prefill and decode inside the scheduler (expose in `/stats`) to explain 40 ms/step under load vs 5.8 ms isolated
+- [ ] Overload must answer 429, not drop connections: raise cpp-httplib's listen backlog
+- [ ] Finer rate sweep around the knee: 4, 6, 8, 10, 12, 14
+- [ ] FP32 vs FP16 below the knee (the saturated comparison was host-bound and meaningless)
 - [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
 - [ ] Baseline in a separate job/venv: vLLM (verify T4 support first) or HF `generate` fallback
 - [ ] GPT-2 medium run (bonus, config-driven)

@@ -258,6 +258,32 @@ Text equality alone is flaky: batch shape changes BLAS kernel choice → ~1e-6 d
 
 Reference runs use HF with `attn_implementation="eager"`, `float32`, and the same thread count.
 
+**Phase 7, first sweep (Kaggle T4, fp16, 32 slots, 2026-09-30).** 18 configurations, prompts 32–256 tokens, 64 output tokens each. Throughput figures are the load generator's own (see the plotting bug below).
+
+| Rate | Policy | Served | TTFT p50 | TTFT p99 | TPOT p50 | Output tok/s |
+|---|---|---|---|---|---|---|
+| 2 | continuous | 40/40 | 178 ms | 379 ms | 3.8 ms | 126 |
+| 2 | static | 40/40 | 226 ms | 572 ms | 6.1 ms | 126 |
+| 8 | continuous | 174/174 | **281 ms** | **793 ms** | **4.7 ms** | 547 |
+| 8 | static | 174/174 | 472 ms | 1012 ms | 8.4 ms | 540 |
+| 16 | continuous | 320/355 | 12.5 s | 17.6 s | 10.2 ms | **733** |
+| 16 | static | 290/355 | 15.6 s | 20.6 s | 9.3 ms | 648 |
+
+What holds up:
+- **Below saturation, continuous batching cuts latency ~40% at equal throughput** (8 req/s). Overloaded, it serves 13% more tokens/s (16 req/s).
+- **Capacity is ~11 req/s (~730 output tok/s)** for this workload: fine at 8 req/s, queueing for seconds at 16.
+- **Slots vs throughput:** 126 / 320 / 465 / 575 / 626 tok/s for 1 / 4 / 8 / 16 / 32 slots — 5× from batching, nearly flat past 16.
+
+What does not, and why:
+1. **The static vs continuous gap is understated.** Every request produced exactly 64 tokens (20480 tokens / 320 requests), so static batching never strands an idle slot — which is continuous batching's main advantage. Treat 40% as a lower bound until the load generator varies output lengths.
+2. **The fp32 vs fp16 serving comparison is meaningless** (639 vs 636 tok/s): both runs were saturated and host-bound. The micro-benchmark is the valid precision comparison.
+3. **Served throughput is ~8× below the GPU's capability.** In isolation a batch-32 decode step takes 5.8 ms (~5500 tok/s); under load at 16 req/s the server managed 646 steps in ~27 s, about **40 ms per step** for the same work. Leading hypothesis: the 4-vCPU host. Decode is launch-bound (Phase 6), and under load the same CPUs also run ~300 HTTP threads, re-decode every stream's text on every token, and host the load generator with up to 1345 threads of its own. Unproven until the scheduler times prefill and decode itself.
+4. **Overload shows up as connection failures, not 429s.** Above ~32 req/s hundreds of requests failed at the TCP level. Likely cause: cpp-httplib's small listen backlog overflowing while the host is saturated. Overload should always answer with a clean 429.
+
+Two tooling bugs found in the process, both fixed:
+- The "port may be shared" warning fired on 8 runs, but each gap was exactly the number of connection failures — requests the server never saw. The check now counts only requests that got an HTTP answer.
+- `plot_results.py` computed wall time as `max(send) + max(done)`, pairing the latest send with the slowest request, so its tokens/s ran ~30% low (514 vs a measured 733). It now uses `max(send + done)` and reproduces the load generator's figure exactly.
+
 **Phase 6 result (Kaggle T4, 2026-09-19): 75/75 tests pass**, including six GPU tests. The first run failed two of them; both were tolerances guessed on CPU, not engine faults (see below).
 
 **The fp16 divergence question, settled with numbers.** Where batched fp16 output differs from a solo run, the gap between the top two logits at that step was **0** for one request (an exact tie in fp16 — the choice was arbitrary) and **0.0625** for the other, which is exactly one fp16 step at that magnitude. Neither is a scheduling bug; fp32 on the same path matches solo output exactly.
