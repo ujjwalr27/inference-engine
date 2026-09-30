@@ -41,7 +41,10 @@ def load(path: Path) -> pd.DataFrame:
 def summary(path: Path) -> dict:
     df = load(path)
     ok = df[df["ok"]]
-    wall_s = (df["send_ms"].max() + df["done_ms"].max()) / 1000.0 if len(df) else 0.0
+    # Wall time is when the last request finished, measured from the run start. Adding the two
+    # column maxima instead would pair the latest send with the slowest request and overstate it.
+    finished = df[df["done_ms"] >= 0]
+    wall_s = (finished["send_ms"] + finished["done_ms"]).max() / 1000.0 if len(finished) else 0.0
     return {
         "name": path.stem,
         "requests": len(df),

@@ -17,6 +17,7 @@ Usage in a notebook cell:
 Flags: --rates 2,8,16,32,64 --duration 20 --slots 32 --quick --repeat N
 """
 import argparse
+import csv
 import json
 import os
 import signal
@@ -77,12 +78,19 @@ def run_load(build: Path, env: dict, port: int, rate: float, duration: float, ou
     sh(f"{build}/gpt2_loadgen --url http://127.0.0.1:{port} --rate {rate} --duration {duration} "
        f"--prompt-min {prompt_min} --prompt-max {prompt_max} --max-tokens {max_tokens} --out {out}", env=env)
     stats = json.loads(sh(f"curl -s http://127.0.0.1:{port}/stats", env=env, quiet=True).stdout)
-    sent = sum(1 for _ in open(out)) - 1
-    if stats.get("submitted") != sent:
-        print(f"WARNING: sent {sent} requests, server counted {stats.get('submitted')} - port may be shared")
+    with open(out) as f:
+        rows = list(csv.DictReader(f))
+    # Status 0 means the connection itself failed, so the server never saw that request.
+    # Only requests that got an HTTP answer should match the server's count.
+    transport_failures = sum(1 for r in rows if r["status"] == "0")
+    reached = len(rows) - transport_failures
+    if stats.get("submitted") != reached:
+        print(f"WARNING: {reached} requests got an HTTP answer but the server counted "
+              f"{stats.get('submitted')} - another process may be sharing the port")
     print(f"    max_batch {stats['max_batch']}/{stats['slots']} | decode steps {stats['decode_steps']} | "
-          f"tokens {stats['generated_tokens']} | rejected {stats['rejected']}")
-    return stats
+          f"tokens {stats['generated_tokens']} | rejected {stats['rejected']} | "
+          f"connection failures {transport_failures}")
+    return {**stats, "transport_failures": transport_failures}
 
 
 def main() -> None:

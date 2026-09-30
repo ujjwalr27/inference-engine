@@ -184,12 +184,15 @@ def main() -> None:
                    f"--duration {args.duration} --prompt-min 32 --prompt-max 256 --max-tokens 64 --out {csv}",
                    env=run_env)
                 stats = sh(f"curl -s http://127.0.0.1:{port}/stats", env=run_env).stdout
-                # The server should have seen exactly the requests the load generator sent.
-                sent = sum(1 for _ in open(csv)) - 1
+                # Requests that got an HTTP answer should match the server's count; status 0 rows
+                # are connection failures the server never saw.
+                with open(csv) as f:
+                    statuses = [line.rstrip("\n").split(",")[-1] for line in list(f)[1:]]
+                reached = sum(1 for s in statuses if s != "0")
                 submitted = json.loads(stats).get("submitted", -1)
-                if submitted != sent:
-                    print(f"WARNING: load generator sent {sent} requests but the server counted {submitted}; "
-                          "another server may be sharing the port")
+                if submitted != reached:
+                    print(f"WARNING: {reached} requests got an HTTP answer but the server counted {submitted}; "
+                          "another process may be sharing the port")
             finally:
                 os.killpg(os.getpgid(server.pid), signal.SIGTERM)
                 try:
