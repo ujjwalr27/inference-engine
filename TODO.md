@@ -241,7 +241,9 @@ at 8 req/s, slots scaling. Needs a second pass:
 - [ ] Finer rate sweep around the knee: 4, 6, 8, 10, 12, 14
 - [ ] FP32 vs FP16 below the knee (the saturated comparison was host-bound and meaningless)
 - [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
-- [ ] Baseline in a separate job/venv: vLLM (verify T4 support first) or HF `generate` fallback
+- [ ] Baseline: `scripts/hf_server.py` (serial `transformers.generate()` behind our API, fp16) driven by the
+      same load generator via `scripts/kaggle_baseline.py`; tested locally on CPU, not yet run on the T4
+- [ ] vLLM baseline (separate job/venv; verify T4 support first)
 - [ ] GPT-2 medium run (bonus, config-driven)
 - [ ] Commit CSVs + PNGs to `results/<date>_<gpu>/`
 

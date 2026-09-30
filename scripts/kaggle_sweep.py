@@ -44,13 +44,20 @@ def sh(cmd, check=True, env=None, quiet=False, tail=3000):
 @contextmanager
 def serving(build: Path, weights: Path, env: dict, port: int, dtype: str, slots: int, policy: str,
             max_queue: int = 256):
+    cmd = [str(build / "gpt2_serve"), "--weights", str(weights), "--device", "cuda", "--dtype", dtype,
+           "--slots", str(slots), "--max-queue", str(max_queue), "--policy", policy, "--port", str(port)]
+    with serving_cmd(cmd, env, port, f"{dtype}, {slots} slots, {policy} batching"):
+        yield
+
+
+@contextmanager
+def serving_cmd(cmd: list, env: dict, port: int, label: str):
+    """Starts any server that speaks the engine's HTTP API, waits for /health, and kills it after."""
     if subprocess.run(f"curl -sf http://127.0.0.1:{port}/health", shell=True,
                       capture_output=True).returncode == 0:
         raise SystemExit(f"port {port} is already serving; restart the kernel before measuring")
 
-    cmd = [str(build / "gpt2_serve"), "--weights", str(weights), "--device", "cuda", "--dtype", dtype,
-           "--slots", str(slots), "--max-queue", str(max_queue), "--policy", policy, "--port", str(port)]
-    print(f"--- server: {dtype}, {slots} slots, {policy} batching")
+    print(f"--- server: {label}")
     server = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               start_new_session=True)
     try:
