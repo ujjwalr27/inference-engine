@@ -1,7 +1,9 @@
 // Tokenizer parity with Python (weights/tokenizer_cases.json) and streaming-decode behaviour.
+#include <atomic>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -84,6 +86,29 @@ TEST_F(TokenizerTest, IncrementalDecodeHoldsBackThenReleases) {
   rest += decoder.flush();
   EXPECT_EQ(rest, "🚀");
   EXPECT_EQ(decoder.tokens().size(), ids.size());
+}
+
+// The server shares one tokenizer between all worker threads. Each thread decodes different text,
+// so a race inside the tokenizer would show up as a thread reading back another thread's result.
+TEST_F(TokenizerTest, OneInstanceIsSafeToShareAcrossThreads) {
+  const std::vector<std::string> texts = {"The quick brown fox", "日本語のテキスト", "🚀 launch sequence",
+                                          "def fibonacci(n):", "Café naïve résumé", "1234567890"};
+  std::vector<std::vector<int64_t>> ids;
+  for (const auto& t : texts) ids.push_back(tok_->encode(t));
+
+  std::atomic<int> mismatches{0};
+  std::vector<std::thread> threads;
+  for (size_t t = 0; t < 8; ++t) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < 300; ++i) {
+        const size_t k = (t + static_cast<size_t>(i)) % texts.size();
+        if (tok_->decode(ids[k]) != texts[k]) ++mismatches;
+        if (tok_->encode(texts[k]) != ids[k]) ++mismatches;
+      }
+    });
+  }
+  for (auto& th : threads) th.join();
+  EXPECT_EQ(mismatches.load(), 0) << "a shared tokenizer returned another thread's result";
 }
 
 TEST_F(TokenizerTest, RejectsMissingFile) {

@@ -1,6 +1,7 @@
 #include "tokenizer/tokenizer.h"
 
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -21,6 +22,9 @@ bool ends_with_replacement(const std::string& s) {
 
 struct Tokenizer::Impl {
   std::unique_ptr<tokenizers::Tokenizer> tok;
+  // tokenizers-cpp's Decode writes into a buffer held by the handle and then reads it back, so two
+  // threads decoding at once could read each other's text. Held only for one call (microseconds).
+  std::mutex mutex;
 };
 
 Tokenizer Tokenizer::from_blob(const std::string& tokenizer_json) {
@@ -40,7 +44,11 @@ Tokenizer Tokenizer::from_file(const std::string& path) {
 }
 
 std::vector<int64_t> Tokenizer::encode(const std::string& text) const {
-  const auto ids = impl_->tok->Encode(text);
+  std::vector<int32_t> ids;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    ids = impl_->tok->Encode(text);
+  }
   return std::vector<int64_t>(ids.begin(), ids.end());
 }
 
@@ -48,10 +56,14 @@ std::string Tokenizer::decode(const std::vector<int64_t>& ids) const {
   std::vector<int32_t> narrow;
   narrow.reserve(ids.size());
   for (int64_t id : ids) narrow.push_back(static_cast<int32_t>(id));
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->tok->Decode(narrow);
 }
 
-size_t Tokenizer::vocab_size() const { return impl_->tok->GetVocabSize(); }
+size_t Tokenizer::vocab_size() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->tok->GetVocabSize();
+}
 
 std::string IncrementalDecoder::push(int64_t token) {
   ids_.push_back(token);

@@ -30,24 +30,22 @@ struct ParsedRequest {
 }  // namespace
 
 struct InferenceServer::Impl {
-  Impl(const GPT2Model& model, Scheduler& scheduler, std::string tokenizer_path, const ServerOptions& options)
-      : model(model), scheduler(scheduler), tokenizer_path(std::move(tokenizer_path)), options(options) {}
+  Impl(const GPT2Model& model, Scheduler& scheduler, const std::string& tokenizer_path, const ServerOptions& options)
+      : model(model), scheduler(scheduler), shared_tokenizer(Tokenizer::from_file(tokenizer_path)), options(options) {}
 
   const GPT2Model& model;
   Scheduler& scheduler;
-  std::string tokenizer_path;
+  // Loaded once at startup and shared by every worker thread. It used to be one instance per
+  // thread, which charged a ~200 ms parse of tokenizer.json to the first request each of the
+  // ~300 workers served: at low load that was most requests, and it made time to first token
+  // slower than a plain Hugging Face server's.
+  Tokenizer shared_tokenizer;
   ServerOptions options;
   httplib::Server server;
   std::thread thread;
   std::atomic<bool> running{false};
 
-  // Parsing tokenizer.json takes a moment, so each worker thread keeps its own instance
-  // instead of sharing one (the wrapper makes no thread-safety promise).
-  const Tokenizer& tokenizer() {
-    static thread_local std::unique_ptr<Tokenizer> local;
-    if (!local) local = std::make_unique<Tokenizer>(Tokenizer::from_file(tokenizer_path));
-    return *local;
-  }
+  const Tokenizer& tokenizer() const { return shared_tokenizer; }
 
   // Throws std::invalid_argument with a client-facing message.
   ParsedRequest parse(const std::string& body) {

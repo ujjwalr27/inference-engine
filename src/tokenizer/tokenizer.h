@@ -10,7 +10,10 @@ namespace gpt2 {
 // GPT-2 byte-level BPE, backed by the Hugging Face tokenizers library (mlc-ai/tokenizers-cpp).
 // Loads the same tokenizer.json that Python uses, so token IDs match exactly.
 //
-// Thread safety is not assumed: give each thread its own instance (they share nothing).
+// Safe to share between threads: calls are serialised internally, because the underlying handle
+// keeps each decode's result in a buffer of its own. Share one instance rather than loading one
+// per thread - parsing tokenizer.json takes ~200 ms, which a per-thread copy charges to the first
+// request each thread serves. Copies share the same instance.
 class Tokenizer {
  public:
   static Tokenizer from_file(const std::string& tokenizer_json_path);
