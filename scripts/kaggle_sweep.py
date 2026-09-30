@@ -21,6 +21,7 @@ import csv
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -56,6 +57,7 @@ def serving_cmd(cmd: list, env: dict, port: int, label: str):
     if subprocess.run(f"curl -sf http://127.0.0.1:{port}/health", shell=True,
                       capture_output=True).returncode == 0:
         raise SystemExit(f"port {port} is already serving; restart the kernel before measuring")
+    wait_for_free_port(port)
 
     print(f"--- server: {label}")
     server = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -72,28 +74,58 @@ def serving_cmd(cmd: list, env: dict, port: int, label: str):
             raise SystemExit("server did not come up")
         yield
     finally:
-        os.killpg(os.getpgid(server.pid), signal.SIGTERM)
+        stop_group(server, signal.SIGTERM)
         try:
             server.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(server.pid), signal.SIGKILL)
-        time.sleep(1)  # let the port close before the next configuration
+            stop_group(server, signal.SIGKILL)
+            server.wait()
+
+
+def stop_group(server: subprocess.Popen, sig: int) -> None:
+    try:
+        os.killpg(os.getpgid(server.pid), sig)
+    except ProcessLookupError:
+        pass  # it already exited, e.g. because it failed to start
+
+
+def wait_for_free_port(port: int, timeout: float = 90.0) -> None:
+    """Nothing answering /health is not enough: a port can refuse a new bind for a while after its
+    previous server exits. Wait until a socket can actually bind it, as the next server will."""
+    deadline = time.time() + timeout
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", port))
+                return
+            except OSError:
+                if time.time() > deadline:
+                    raise SystemExit(f"port {port} still cannot be bound after {timeout:.0f} s")
+                time.sleep(1)
+
+
+def server_stats(port: int, env: dict) -> dict:
+    return json.loads(sh(f"curl -s http://127.0.0.1:{port}/stats", env=env, quiet=True).stdout)
 
 
 def run_load(build: Path, env: dict, port: int, rate: float, duration: float, out: Path,
              prompt_min=32, prompt_max=256, max_tokens=64) -> dict:
+    # Count only what this run submits: a warm-up request beforehand is not part of the load.
+    before = server_stats(port, env).get("submitted", 0)
     sh(f"{build}/gpt2_loadgen --url http://127.0.0.1:{port} --rate {rate} --duration {duration} "
        f"--prompt-min {prompt_min} --prompt-max {prompt_max} --max-tokens {max_tokens} --out {out}", env=env)
-    stats = json.loads(sh(f"curl -s http://127.0.0.1:{port}/stats", env=env, quiet=True).stdout)
+    stats = server_stats(port, env)
+    submitted = stats.get("submitted", 0) - before
     with open(out) as f:
         rows = list(csv.DictReader(f))
     # Status 0 means the connection itself failed, so the server never saw that request.
     # Only requests that got an HTTP answer should match the server's count.
     transport_failures = sum(1 for r in rows if r["status"] == "0")
     reached = len(rows) - transport_failures
-    if stats.get("submitted") != reached:
-        print(f"WARNING: {reached} requests got an HTTP answer but the server counted "
-              f"{stats.get('submitted')} - another process may be sharing the port")
+    if submitted != reached:
+        print(f"WARNING: {reached} requests got an HTTP answer but the server counted {submitted} "
+              "during this run - another process may be sharing the port")
     print(f"    max_batch {stats['max_batch']}/{stats['slots']} | decode steps {stats['decode_steps']} | "
           f"tokens {stats['generated_tokens']} | rejected {stats['rejected']} | "
           f"connection failures {transport_failures}")
