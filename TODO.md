@@ -241,10 +241,13 @@ at 8 req/s, slots scaling. Needs a second pass:
 - [ ] Finer rate sweep around the knee: 4, 6, 8, 10, 12, 14
 - [ ] FP32 vs FP16 below the knee (the saturated comparison was host-bound and meaningless)
 - [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
-- [x] Baseline vs plain Hugging Face on the T4: 5.2x throughput at 8 req/s, 2.3-2.6x cheaper tokens
-- [x] It exposed an engine bug: per-thread tokenizer loads (~200 ms each) inflated low-load TTFT.
-      Fixed with one shared tokenizer; locally TTFT p50 617 -> 164 ms at 1 req/s
-- [ ] Re-run the baseline on the T4 after the tokenizer fix
+- [x] Baseline vs plain Hugging Face on the T4 (after the fix): 6.3x throughput at 8 req/s,
+      1.6-1.7x cheaper tokens, first token in 9-11 ms at every load
+- [x] It exposed an engine bug: per-thread tokenizer loads (~200 ms each). Fixed with one shared
+      tokenizer; T4 TTFT p50 143-241 ms -> 9-11 ms
+- [x] Correction: the earlier 2.3-2.6x per-token claim was an artifact of that bug (TPOT below one decode step)
+- [ ] Re-run the full sweep: its latencies were distorted by the same bug; capacity may also rise
+- [ ] Commit the baseline CSVs (download from Kaggle together with the re-run sweep)
 - [ ] vLLM baseline (separate job/venv; verify T4 support first)
 - [ ] GPT-2 medium run (bonus, config-driven)
 - [ ] Commit CSVs + PNGs to `results/<date>_<gpu>/`
