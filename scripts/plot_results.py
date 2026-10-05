@@ -13,8 +13,8 @@ Usage:
   # compare runs side by side (e.g. static vs continuous, fp32 vs fp16)
   python scripts/plot_results.py compare results/static.csv results/continuous.csv
 
-  # the four README charts from a kaggle_sweep.py results directory
-  python scripts/plot_results.py readme results/2026-09-30_t4
+  # the README charts from a kaggle_sweep.py (+ kaggle_baseline.py) results directory
+  python scripts/plot_results.py readme results/2026-10-05_t4 --rate 32
 """
 import argparse
 import re
@@ -59,6 +59,7 @@ def summary(path: Path) -> dict:
         "ttft_p99": ok["ttft_ms"].quantile(0.99) if len(ok) else float("nan"),
         "tpot_p50": ok["tpot_ms"].dropna().quantile(0.50) if len(ok) else float("nan"),
         "output_tokens": int(ok["output_tokens"].sum()),
+        "requests_per_s": len(ok) / wall_s if wall_s > 0 else float("nan"),
         "tokens_per_s": ok["output_tokens"].sum() / wall_s if wall_s > 0 else float("nan"),
     }
 
@@ -135,6 +136,7 @@ def cmd_compare(args) -> None:
 # follows the entity: continuous / fp16 are slot 1, static / fp32 slot 2, in every chart.
 INK, INK_2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e5e1", "#fcfcfb"
 SLOT_1, SLOT_2 = "#2a78d6", "#eb6834"
+SLOT_3 = "#1baf7a"  # aqua, Hugging Face; under 3:1 on the surface, so its values are always labelled
 
 
 def readme_style() -> None:
@@ -167,35 +169,62 @@ def rate_points(results: Path, policy: str) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("rate")
 
 
+MS_TICKS = (2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000)
+
+
+def ms_label(ms: float) -> str:
+    return f"{ms:g} ms" if ms < 1000 else f"{ms / 1000:g} s"
+
+
+def log_ms_axis(ax, values, pad_low: float, pad_high: float) -> None:
+    low, high = min(values) * pad_low, max(values) * pad_high
+    ticks = [t for t in MS_TICKS if low <= t <= high]
+    ax.set_yscale("log")
+    ax.set_ylim(low, high)
+    ax.set_yticks(ticks, [ms_label(t) for t in ticks])
+    ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+
+
 def chart_ttft_vs_rate(results: Path, out: Path, context: str) -> None:
     fig, ax = plt.subplots(figsize=(8, 4.8))
     handles = []
+    values = []
     for policy, color in (("continuous", SLOT_1), ("static", SLOT_2)):
         data = rate_points(results, policy)
         if data.empty:
             continue
-        (line,) = ax.plot(data["rate"], data["ttft_p50"] / 1000, color=color, marker="o", label=policy)
-        ax.plot(data["rate"], data["ttft_p99"] / 1000, color=color, linestyle=(0, (4, 3)), marker="o",
+        (line,) = ax.plot(data["rate"], data["ttft_p50"], color=color, marker="o", label=policy)
+        ax.plot(data["rate"], data["ttft_p99"], color=color, linestyle=(0, (4, 3)), marker="o",
                 markerfacecolor=SURFACE)
         handles.append(line)
+        values += list(data["ttft_p50"]) + list(data["ttft_p99"])
+    cont = rate_points(results, "continuous")
     ax.set_xscale("log", base=2)
-    ax.set_yscale("log")
-    rates = sorted(set(rate_points(results, "continuous")["rate"]))
+    rates = sorted(set(cont["rate"]))
     ax.set_xticks(rates, [f"{r:g}" for r in rates])
-    seconds = [0.2, 0.5, 1, 2, 5, 10, 20, 50]
-    ax.set_yticks(seconds, [f"{s:g}" for s in seconds])
-    ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    log_ms_axis(ax, values, 0.6, 2.5)
     ax.set_xlabel("offered load (requests per second)")
-    ax.set_ylabel("time to first token (s, log scale)")
+    ax.set_ylabel("time to first token (log scale)")
     ax.set_title("Latency stays flat until capacity, then queueing takes over")
-    ax.axvspan(8, 16, color=GRID, alpha=0.6, zorder=0, linewidth=0)
-    ax.text(11.3, ax.get_ylim()[1] * 0.6, "capacity\n~11 req/s", ha="center", va="top", fontsize=8, color=INK_2)
+
+    # Capacity lies between the last rate served without rejections and the first one with them;
+    # at the first saturated rate, the completed request rate is the measured capacity itself.
+    served = cont[cont["busy_429"] == 0]["rate"]
+    saturated = cont[cont["busy_429"] > 0].sort_values("rate")
+    reject_note = ""
+    if len(served) and len(saturated):
+        lo, hi = served.max(), saturated["rate"].iloc[0]
+        capacity = saturated["requests_per_s"].iloc[0]
+        ax.axvspan(lo, hi, color=GRID, alpha=0.6, zorder=0, linewidth=0)
+        ax.text((lo * hi) ** 0.5, ax.get_ylim()[1] * 0.6, f"capacity\n~{capacity:.0f} req/s", ha="center",
+                va="top", fontsize=8, color=INK_2)
+        reject_note = f" · at {hi:g} req/s the queue fills and requests are rejected"
     style_handles = [plt.Line2D([], [], color=INK_2, marker="o", label="p50"),
                      plt.Line2D([], [], color=INK_2, linestyle=(0, (4, 3)), marker="o",
                                 markerfacecolor=SURFACE, label="p99")]
     ax.legend(handles=handles + style_handles, loc="upper left", ncols=2)
     tidy(ax)
-    footnote(fig, context + " · above ~16 req/s the queue fills and requests are rejected")
+    footnote(fig, context + reject_note)
     fig.tight_layout(rect=(0, 0.05, 1, 1))
     save(fig, out)
 
@@ -254,8 +283,12 @@ def chart_slots(results: Path, out: Path, context: str) -> None:
     ax.set_ylim(0, data["tokens_per_s"].max() * 1.2)
     ax.set_xlabel("KV-cache slots (concurrent requests)")
     ax.set_ylabel("output tokens per second")
-    gain = data["tokens_per_s"].iloc[-1] / data["tokens_per_s"].iloc[0]
-    ax.set_title(f"Batching raises throughput {gain:.0f}x, flattening past 16 slots")
+    tps, slots = data["tokens_per_s"].to_numpy(), data["slots"].to_numpy()
+    gain = tps[-1] / tps[0]
+    # If the last doubling of slots still bought >25% more throughput, it has not levelled off.
+    trend = (f"still rising at {slots[-1]}" if len(tps) > 1 and tps[-1] / tps[-2] > 1.25
+             else f"levelling off past {slots[-2]}")
+    ax.set_title(f"{slots[-1]} slots serve {gain:.0f}x the tokens of 1 slot, {trend}")
     tidy(ax)
     footnote(fig, context.replace(" · 32 slots", "") + " · saturating load (64 req/s offered)")
     fig.tight_layout(rect=(0, 0.05, 1, 1))
@@ -288,10 +321,73 @@ def chart_decode_step(results: Path, out: Path, context: str) -> None:
         tidy(ax)
     axes[0].set_ylabel("ms per decode step")
     axes[0].legend(loc="upper left")
-    fig.suptitle("In fp16, one decode step costs ~5 ms for 1 request or for 16",
-                 x=0.01, ha="left", fontsize=12, fontweight="bold")
+    short = decode[(decode["dtype"] == "fp16") & (decode["length"] == lengths[0])].set_index("batch")["ms"]
+    if 1 in short.index and 16 in short.index:
+        title = (f"In fp16, a decode step costs {short[1]:.1f} ms for 1 request and {short[16]:.1f} ms for 16 "
+                 f"(cache length {lengths[0]})")
+    else:
+        title = "Decode step time by batch size"
+    fig.suptitle(title, x=0.01, ha="left", fontsize=12, fontweight="bold")
     footnote(fig, context.split(" · ")[0] + " · gpt2_bench: 20 timed steps after 5 warm-up, device synchronised")
     fig.tight_layout(rect=(0, 0.05, 1, 0.93))
+    save(fig, out)
+
+
+def chart_baseline(results: Path, out: Path, context: str) -> None:
+    """Engine vs plain Hugging Face transformers (scripts/kaggle_baseline.py) under the same load."""
+    servers = (("engine", "this engine", SLOT_1), ("huggingface", "Hugging Face generate()", SLOT_3))
+    points = {}
+    for key, _, _ in servers:
+        rows = []
+        for path in results.glob(f"baseline_{key}_rate*.csv"):
+            s = summary(path)
+            s["rate"] = float(re.search(r"rate(\d+(?:\.\d+)?)", path.stem).group(1))
+            rows.append(s)
+        if rows:
+            points[key] = pd.DataFrame(rows).set_index("rate").sort_index()
+    if len(points) < 2:
+        return
+    rates = sorted(set(points["engine"].index) & set(points["huggingface"].index))
+    fig, (left, right) = plt.subplots(1, 2, figsize=(11, 4.4))
+
+    width = 0.38
+    for j, (key, label, color) in enumerate(servers):
+        d = points[key].loc[rates]
+        x = np.arange(len(rates)) + (j - 0.5) * width
+        left.bar(x, d["tokens_per_s"], width=width, color=color, edgecolor=SURFACE, linewidth=2, label=label)
+        for xi, v in zip(x, d["tokens_per_s"]):
+            left.text(xi, v, f"{v:.0f}", ha="center", va="bottom", fontsize=9, color=INK)
+        right.plot(rates, d["ttft_p50"], color=color, marker="o", label=label)
+        for r, v in zip(rates, d["ttft_p50"]):
+            shown = float(f"{v:.2g}") if v >= 1000 else round(v)
+            # The engine sits below Hugging Face everywhere, so its labels go under its line.
+            below = key == "engine"
+            right.annotate(ms_label(shown), (r, v), xytext=(0, -14 if below else 8), textcoords="offset points",
+                           ha="center", va="top" if below else "bottom", fontsize=9, color=INK)
+    left.set_xticks(range(len(rates)), [f"{r:g}" for r in rates])
+    left.set_xlabel("offered load (requests per second)")
+    left.set_ylabel("output tokens per second")
+    left.set_title("Throughput")
+    left.legend(loc="upper left")
+
+    right.set_xscale("log", base=2)
+    right.set_xticks(rates, [f"{r:g}" for r in rates])
+    values = list(points["engine"].loc[rates, "ttft_p50"]) + list(points["huggingface"].loc[rates, "ttft_p50"])
+    log_ms_axis(right, values, 0.25, 4)
+    right.set_xlabel("offered load (requests per second)")
+    right.set_ylabel("time to first token, p50 (log scale)")
+    right.set_title("Time to first token")
+    for ax in (left, right):
+        tidy(ax)
+
+    top = rates[-1]
+    ratio = points["engine"].loc[top, "tokens_per_s"] / points["huggingface"].loc[top, "tokens_per_s"]
+    hf_cap = points["huggingface"]["requests_per_s"].max()
+    fig.suptitle(f"At {top:g} req/s the engine serves {ratio:.1f}x the tokens of a plain Hugging Face server, "
+                 f"which tops out near {hf_cap:.1f} req/s", x=0.01, ha="left", fontsize=12, fontweight="bold")
+    footnote(fig, context.replace(" · 32 slots", "") + " · engine: 32 slots, continuous batching · "
+             "Hugging Face: transformers generate(), one request at a time")
+    fig.tight_layout(rect=(0, 0.05, 1, 0.94))
     save(fig, out)
 
 
@@ -304,13 +400,14 @@ def cmd_readme(args) -> None:
     chart_policy_at_rate(results, args.rate, out_dir / "continuous_vs_static.png", context)
     chart_slots(results, out_dir / "slots_vs_throughput.png", context)
     chart_decode_step(results, out_dir / "decode_step_vs_batch.png", context)
+    chart_baseline(results, out_dir / "engine_vs_huggingface.png", context)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
 
-    readme = sub.add_parser("readme", help="the four README charts from one results directory")
+    readme = sub.add_parser("readme", help="the README charts from one results directory")
     readme.add_argument("files", nargs=1, metavar="RESULTS_DIR")
     readme.add_argument("--out")
     readme.add_argument("--label")
