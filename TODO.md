@@ -227,30 +227,26 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 `scripts/kaggle_sweep.py` runs all four sweeps in one job, each configuration on its own server
 process (started in its own process group, killed afterwards, port checked first).
 
-First sweep done (2026-09-30), results in IMPLEMENTATION.md. Valid: knee ~11 req/s, continuous −40% latency
-at 8 req/s, slots scaling. Needs a second pass:
+Re-run after the tokenizer fix (2026-10-05), results in IMPLEMENTATION.md and `results/2026-10-05_t4/`:
+capacity ~50 req/s (~3200 tok/s), continuous batching -95% first-token latency vs static, 4.7x Hugging Face.
 
-- [x] Request-rate sweep → knee between 8 and 16 req/s
-- [x] Static vs continuous batching, same load (lower bound only, see below)
-- [x] Slots vs throughput (1, 4, 8, 16, 32)
+- [x] Request-rate sweep -> capacity between 32 and 64 req/s (~50 measured)
+- [x] Static vs continuous batching, same load (latency gap only; see output lengths below)
+- [x] Slots vs throughput (1, 4, 8, 16, 32): 16x, still rising at 32
+- [x] FP32 vs FP16 below capacity: same throughput, fp16 24% faster per request
 - [x] Fix: false "port may be shared" warning (it was counting connection failures)
 - [x] Fix: `plot_results.py` throughput ~30% low (wrong wall-time formula)
-- [ ] Load generator: varied output lengths, so static batching's idle-slot cost is visible
-- [ ] Time prefill and decode inside the scheduler (expose in `/stats`) to explain 40 ms/step under load vs 5.8 ms isolated
-- [ ] Overload must answer 429, not drop connections: raise cpp-httplib's listen backlog
-- [ ] Finer rate sweep around the knee: 4, 6, 8, 10, 12, 14
-- [ ] FP32 vs FP16 below the knee (the saturated comparison was host-bound and meaningless)
-- [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
-- [x] Baseline vs plain Hugging Face on the T4 (after the fix): 6.3x throughput at 8 req/s,
-      1.6-1.7x cheaper tokens, first token in 9-11 ms at every load
-- [x] It exposed an engine bug: per-thread tokenizer loads (~200 ms each). Fixed with one shared
-      tokenizer; T4 TTFT p50 143-241 ms -> 9-11 ms
+- [x] Baseline vs plain Hugging Face on the T4: 4.7x throughput at 8 req/s, 1.4-1.7x cheaper tokens,
+      first token in 7-9 ms at every load (vs 16 ms idle and 37 s at 8 req/s)
+- [x] It exposed an engine bug: per-thread tokenizer loads (~200 ms each). Fixed with one shared tokenizer
 - [x] Correction: the earlier 2.3-2.6x per-token claim was an artifact of that bug (TPOT below one decode step)
-- [ ] Re-run the full sweep: its latencies were distorted by the same bug; capacity may also rise
-- [ ] Commit the baseline CSVs (download from Kaggle together with the re-run sweep)
+- [x] Re-run the full sweep: served throughput 730 -> 3239 tok/s; overload now answers 429, no dropped connections
+- [x] Commit CSVs + PNGs to `results/2026-10-05_t4/`, with an engine-vs-Hugging-Face chart; chart titles computed from the data
+- [ ] Load generator: varied output lengths, so static batching's idle-slot cost is visible
+- [ ] Time prefill and decode inside the scheduler (expose in `/stats`): ~10 ms per served step vs 5.3-6.1 ms isolated
+- [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
 - [ ] vLLM baseline (separate job/venv; verify T4 support first)
 - [ ] GPT-2 medium run (bonus, config-driven)
-- [ ] Commit CSVs + PNGs to `results/<date>_<gpu>/`
 
 **Done when:** 4–5 clean, labelled charts.
 

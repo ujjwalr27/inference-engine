@@ -56,7 +56,7 @@ Design rules:
 |---|---|---|
 | OS | Ubuntu 26.04.1, 16 threads (LibTorch uses 8), ~6 GB RAM visible to WSL | Ubuntu 22.04 image, **4 vCPU**, 31 GB RAM, 20 GB `/kaggle/working` |
 | Compiler / CMake | GCC 15.2 | **GCC 11.4**, CMake 3.31, Ninja 1.13 — stay strictly C++17 so both compile |
-| PyTorch / LibTorch | LibTorch **2.10.0+cpu** (`libtorch-shared-with-deps-2.10.0%2Bcpu.zip`, cxx11 ABI only) | pip `torch 2.10.0+cu128`, `_GLIBCXX_USE_CXX11_ABI = True` |
+| PyTorch / LibTorch | LibTorch **2.10.0+cpu** (`libtorch-shared-with-deps-2.10.0%2Bcpu.zip`, cxx11 ABI only) | pip `torch 2.10.0+cu128` (2.11.0+cu128 since 2026-10; both pass), `_GLIBCXX_USE_CXX11_ABI = True` |
 | CUDA | — | **12.8**, nvcc 12.8.93 present, driver 580, **2× Tesla T4** (sm 7.5, 15 GB each), cuDNN 9.10 |
 | Python | 3.12 via `uv` (system 3.14 left alone) | 3.12.13 |
 | Rust | via `rustup` | **not installed** → `rustup` in the job, or prebuilt tokenizers libs as a dataset |
@@ -211,7 +211,7 @@ Continuous batching (§6.2) avoids all of this: each request is prefilled on its
 
 - `tokenizers::Tokenizer::FromBlobJSON(read("weights/tokenizer.json"))`, `Encode`, `Decode`.
 - **One instance, loaded at server start and shared by every HTTP worker**, with calls serialised by a mutex inside the wrapper: tokenizers-cpp's `Decode` writes its result into a buffer held by the handle and reads it back, so concurrent calls on one handle could swap results. The lock is held for microseconds.
-- It was originally one instance per worker thread (`thread_local`). Loading `tokenizer.json` takes ~200 ms, and with ~300 workers most low-load requests landed on a thread paying that load — the Hugging Face baseline exposed it (see the Phase 7 baseline result).
+- It was originally one instance per worker thread (`thread_local`). Loading `tokenizer.json` takes ~200 ms, and with ~300 workers most low-load requests landed on a thread paying that load — the Hugging Face baseline exposed it (see the Phase 7 results).
 - **IncrementalDecoder** for streaming: keep all generated IDs, decode the full list each step, emit only the new suffix; hold back if the text ends in `U+FFFD` (incomplete UTF-8 sequence).
 
 ---
@@ -259,51 +259,58 @@ Text equality alone is flaky: batch shape changes BLAS kernel choice → ~1e-6 d
 
 Reference runs use HF with `attn_implementation="eager"`, `float32`, and the same thread count.
 
-**Phase 7 baseline: the engine vs plain Hugging Face (Kaggle T4, fp16, 2026-10-01, after the tokenizer fix).** `scripts/hf_server.py` serves `transformers` `generate()` behind the engine's own API, one request at a time; `scripts/kaggle_baseline.py` drives both with the same load generator, seed, prompts (32–256 tokens) and 64-token outputs, in the same session.
+**Phase 7 results (Kaggle T4, fp16, 2026-10-05, after the tokenizer fix).** One session, one build (Kaggle now ships torch 2.11.0+cu128; 79/79 tests pass on it). Every run: prompts of 32–256 tokens, 64 output tokens, open-loop Poisson arrivals for 20 s, each configuration on a fresh server. Data and charts in `results/2026-10-05_t4/`; regenerate the charts with `python scripts/plot_results.py readme results/2026-10-05_t4 --rate 32`. Zero transport failures in all 25 runs.
+
+**Baseline: the engine vs plain Hugging Face.** `scripts/hf_server.py` serves `transformers` `generate()` (fp16, on the same GPU) behind the engine's own API, one request at a time; `scripts/kaggle_baseline.py` drives both with the same load generator and seed.
 
 | Load | Engine TTFT p50 / p99 | HF TTFT p50 / p99 | Engine TPOT p50 | HF TPOT p50 | Engine tok/s | HF tok/s |
 |---|---|---|---|---|---|---|
-| 1 req/s | **9 / 27 ms** | 21 ms / 1.2 s | **6.8 ms** | 11.3 ms | 61 | 59 |
-| 2 req/s | **9 / 27 ms** | 4.0 / 10.1 s | **6.7 ms** | 11.3 ms | 126 | 88 |
-| 4 req/s | **11 / 22 ms** | 19.4 / 37.3 s | **6.9 ms** | 11.7 ms | 245 | 85 |
-| 8 req/s | **11 / 22 ms** | 53.1 / 105.9 s | **7.3 ms** | 11.4 ms | **549** | 87 |
+| 1 req/s | **7 / 23 ms** | 16 / 864 ms | **5.0 ms** | 8.6 ms | 62 | 60 |
+| 2 req/s | **8 / 20 ms** | 958 ms / 3.9 s | **5.4 ms** | 8.2 ms | 127 | 118 |
+| 4 req/s | **9 / 21 ms** | 11.0 / 20.8 s | **5.6 ms** | 8.3 ms | 246 | 120 |
+| 8 req/s | **9 / 20 ms** | 37.1 / 74.2 s | **5.9 ms** | 8.5 ms | **551** | 117 |
 
-- **6.3× the throughput at 8 req/s**, and the engine is not yet saturated there. Serial `generate()` tops out at ~1.36 req/s (~87 tok/s): 64 tokens × 11.3 ms ≈ 0.72 s per request.
-- **Each token is 1.6–1.7× cheaper** even with little batching: `generate()` pays Python-level overhead every step (logits processors, stopping criteria, the streamer); the engine's decode loop is C++.
-- **First token in 9–11 ms at every load**, against 21 ms for Hugging Face when idle and tens of seconds once its queue builds. A whole 64-token request takes 469 ms at 8 req/s, against 53.8 s.
-- Session-to-session variance on Kaggle is large: this session's single-request decode step measured 5.9–6.5 ms against 5.0–5.3 ms in the previous one, and Hugging Face's TPOT 11.3 against 9.4 ms. Compare within a session only.
+- **4.7× the throughput at 8 req/s**, where the engine is nowhere near its limit (capacity ~50 req/s, below). Serial `generate()` tops out at ~1.9 req/s (~118 tok/s): 64 tokens × 8.3 ms ≈ 0.53 s per request.
+- **Each token is 1.4–1.7× cheaper**, even with little batching: `generate()` pays Python-level overhead every step (logits processors, stopping criteria, the streamer); the engine's decode loop is C++.
+- **First token in 7–9 ms at every load**, against 16 ms for Hugging Face when idle and tens of seconds once its queue builds. A whole 64-token request takes 380 ms at 8 req/s, against 37.6 s.
+- This is the naive baseline. Hugging Face TGI and vLLM batch continuously too; they have not been measured here.
+- Kaggle sessions vary: the 2026-10-01 session measured Hugging Face at 11.3 ms/token and 87 tok/s (6.3× at 8 req/s) and the engine at 6.7–7.3 ms/token. Compare within a session only.
 
-**The bug this comparison found.** The first run (2026-09-30) had Hugging Face *faster* to the first token at 1 req/s, 18 against 143 ms. Every HTTP worker thread loaded its own tokenizer on its first request; loading `tokenizer.json` measures 180–260 ms, and with ~300 workers nearly every low-load request landed on a thread that had not loaded one yet. Fixed by sharing one tokenizer (§7): engine TTFT p50 went from 143–241 ms to **9–11 ms** on the T4.
+**Continuous vs static batching** (32 slots; static gathers up to 32 requests for at most 50 ms, then runs that batch to completion).
 
-**The bug also distorted time per token — in the flattering direction.** That first run reported an engine TPOT of 3.6–4.1 ms, faster than a single decode step measured in the same session (5.0–5.3 ms), which is impossible. The scheduler kept generating while the HTTP thread was loading its tokenizer; tokens piled up in the request's channel and then left in a burst, so the first token looked late and the rest looked impossibly fast. The earlier claim of "2.3–2.6× cheaper per token" came from that artifact; the honest figure is 1.6–1.7×.
+| Rate | Policy | Served | TTFT p50 | TTFT p99 | TPOT p50 | Total p50 | Output tok/s |
+|---|---|---|---|---|---|---|---|
+| 2 | continuous | 40/40 | **7 ms** | 242 ms | 5.4 ms | **348 ms** | 127 |
+| 2 | static | 40/40 | 139 ms | 420 ms | 4.8 ms | 500 ms | 126 |
+| 8 | continuous | 174/174 | **9 ms** | 91 ms | 5.9 ms | **379 ms** | 551 |
+| 8 | static | 174/174 | 255 ms | 472 ms | 5.9 ms | 635 ms | 549 |
+| 16 | continuous | 355/355 | **10 ms** | 144 ms | 6.6 ms | **427 ms** | 1111 |
+| 16 | static | 355/355 | 281 ms | 535 ms | 6.3 ms | 682 ms | 1097 |
+| 32 | continuous | 705/705 | **11 ms** | 272 ms | 7.9 ms | **509 ms** | 2205 |
+| 32 | static | 705/705 | 350 ms | 663 ms | 7.3 ms | 815 ms | 2182 |
+| 64 | continuous | 1259/1345 (86 × 429) | 3.7 s | 4.9 s | 9.6 ms | 4.3 s | 3194 |
+| 64 | static | 1260/1345 (85 × 429) | 3.8 s | 4.8 s | 8.2 ms | 4.3 s | 3214 |
 
-**Consequences for the first sweep below.** It ran with the same bug, so its first-token and per-token latencies are distorted the same way, including the "40% lower latency" of continuous over static batching. Throughput figures and the decode micro-benchmark are unaffected. The bug may also explain much of the gap between served throughput and the GPU's decode rate: under heavy load, ~300 workers each parsing a 3.5 MB file is up to a minute of CPU time inside a 20 s run on 4 vCPUs. The sweep needs re-running to settle both.
+- **Below capacity, continuous batching cuts first-token latency 95–97% and whole-request latency 30–40%** at the same throughput. Under static batching a newcomer waits for the running batch to finish all 64 steps (~0.4 s); under continuous it joins at the next step.
+- Static has slightly lower TPOT (7.3 vs 7.9 ms at 32 req/s): continuous batching interleaves newcomers' prefills between running requests' decode steps. That is the trade it makes.
+- **Capacity is ~50 req/s (~3200 output tok/s)** for this workload, for both policies. Throughput is equal because every request produces exactly 64 tokens, so static batching never strands a finished request's slot. That is continuous batching's other advantage, and this workload cannot show it until the load generator varies output lengths.
+- Overload is handled cleanly: at 64 req/s the queue fills and the excess gets 429s, with no dropped connections.
 
-**Phase 7, first sweep (Kaggle T4, fp16, 32 slots, 2026-09-30) — latencies superseded.** Measured before the tokenizer fix: first-token and per-token latencies below are distorted (see above); throughput figures stand. 18 configurations, prompts 32–256 tokens, 64 output tokens each. Throughput figures are the load generator's own (see the plotting bug below).
+**Slots vs throughput** (saturating load, 64 req/s offered): 200 / 649 / 1188 / 2048 / 3239 tok/s for 1 / 4 / 8 / 16 / 32 slots, **16× from batching and still rising at 32** (the last doubling added 58%). TPOT grows from 4.9 to 9.5 ms over the same range; that is the per-request price of the throughput.
 
-| Rate | Policy | Served | TTFT p50 | TTFT p99 | TPOT p50 | Output tok/s |
-|---|---|---|---|---|---|---|
-| 2 | continuous | 40/40 | 178 ms | 379 ms | 3.8 ms | 126 |
-| 2 | static | 40/40 | 226 ms | 572 ms | 6.1 ms | 126 |
-| 8 | continuous | 174/174 | **281 ms** | **793 ms** | **4.7 ms** | 547 |
-| 8 | static | 174/174 | 472 ms | 1012 ms | 8.4 ms | 540 |
-| 16 | continuous | 320/355 | 12.5 s | 17.6 s | 10.2 ms | **733** |
-| 16 | static | 290/355 | 15.6 s | 20.6 s | 9.3 ms | 648 |
+**fp32 vs fp16 serving at 16 req/s** (below capacity): same throughput (1109 vs 1111 tok/s; the load sets it), but fp16 is faster per request: TTFT p50 10 vs 16 ms, TPOT 6.6 vs 8.6 ms, whole request 427 vs 562 ms. fp16 also halves the KV cache (1152 vs 2304 MiB for 32 slots).
 
-What holds up:
-- **Below saturation, continuous batching cuts latency ~40% at equal throughput** (8 req/s). Overloaded, it serves 13% more tokens/s (16 req/s).
-- **Capacity is ~11 req/s (~730 output tok/s)** for this workload: fine at 8 req/s, queueing for seconds at 16.
-- **Slots vs throughput:** 126 / 320 / 465 / 575 / 626 tok/s for 1 / 4 / 8 / 16 / 32 slots — 5× from batching, nearly flat past 16.
+**Served vs isolated decode speed.** At saturation the server ran 2522 decode steps in ~25 s, about 10 ms per step including the prefills between them, against 5.3–6.1 ms for an isolated batch-32 fp16 decode step. Served throughput is ~54% of the isolated decode rate. Before the tokenizer fix, the server managed only ~15% of it (~40 ms per step, ~730 tok/s at an apparent capacity of ~11 req/s). That gap is gone: it was the tokenizer bug, not the 4-vCPU host. What remains is prefill time and host overhead, which scheduler-side timing in `/stats` would split.
 
-What does not, and why:
-1. **The static vs continuous gap is understated.** Every request produced exactly 64 tokens (20480 tokens / 320 requests), so static batching never strands an idle slot — which is continuous batching's main advantage. Treat 40% as a lower bound until the load generator varies output lengths.
-2. **The fp32 vs fp16 serving comparison is meaningless** (639 vs 636 tok/s): both runs were saturated and host-bound. The micro-benchmark is the valid precision comparison.
-3. **Served throughput is ~8× below the GPU's capability.** In isolation a batch-32 decode step takes 5.8 ms (~5500 tok/s); under load at 16 req/s the server managed 646 steps in ~27 s, about **40 ms per step** for the same work. Leading hypothesis: the 4-vCPU host. Decode is launch-bound (Phase 6), and under load the same CPUs also run ~300 HTTP threads, re-decode every stream's text on every token, and host the load generator with up to 1345 threads of its own. Unproven until the scheduler times prefill and decode itself.
-4. **Overload shows up as connection failures, not 429s.** Above ~32 req/s hundreds of requests failed at the TCP level. Likely cause: cpp-httplib's small listen backlog overflowing while the host is saturated. Overload should always answer with a clean 429.
+**The bug the baseline found.** The first baseline run (2026-09-30) had Hugging Face *faster* to the first token at 1 req/s, 18 against 143 ms. Every HTTP worker thread loaded its own tokenizer on its first request; loading `tokenizer.json` measures 180–260 ms, and with ~300 workers nearly every low-load request landed on a thread that had not loaded one yet. Under heavy load it was worse: ~300 workers each parsing a 3.5 MB file is up to a minute of CPU time inside a 20 s run on 4 vCPUs. Fixed by sharing one tokenizer (§7).
 
-Two tooling bugs found in the process, both fixed:
-- The "port may be shared" warning fired on 8 runs, but each gap was exactly the number of connection failures — requests the server never saw. The check now counts only requests that got an HTTP answer.
-- `plot_results.py` computed wall time as `max(send) + max(done)`, pairing the latest send with the slowest request, so its tokens/s ran ~30% low (514 vs a measured 733). It now uses `max(send + done)` and reproduces the load generator's figure exactly.
+**It also distorted time per token, in the flattering direction.** That run reported an engine TPOT of 3.6–4.1 ms, faster than a single decode step measured in the same session (5.0–5.3 ms), which is impossible. The scheduler kept generating while the HTTP thread was loading its tokenizer; tokens piled up in the request's channel and then left in a burst, so the first token looked late and the rest looked impossibly fast. The early claim of "2.3–2.6× cheaper per token" came from that artifact.
+
+**The first sweep (2026-09-30), superseded.** It ran with the bug and concluded: capacity ~11 req/s (~730 tok/s), continuous batching ~40% lower latency than static at 8 req/s, throughput nearly flat past 16 slots, served throughput ~8× below the GPU's decode rate, and overload showing up as dropped connections instead of 429s. The re-run above overturns every one of those except the direction of the policy comparison; all five were symptoms of CPU time lost to tokenizer loads. Its data is in git history (`results/2026-09-30_t4/`, removed in the commit that added the re-run).
+
+Two tooling bugs found along the way, both fixed:
+- The "port may be shared" warning fired on 8 runs, but each gap was exactly the number of connection failures, i.e. requests the server never saw. The check now counts only requests that got an HTTP answer.
+- `plot_results.py` computed wall time as `max(send) + max(done)`, pairing the latest send with the slowest request, so its tokens/s ran ~30% low. It now uses `max(send + done)` and reproduces the load generator's figure exactly.
 
 **Phase 6 result (Kaggle T4, 2026-09-19): 75/75 tests pass**, including six GPU tests. The first run failed two of them; both were tolerances guessed on CPU, not engine faults (see below).
 
