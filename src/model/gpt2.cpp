@@ -152,7 +152,7 @@ torch::Tensor GPT2Model::decode_padded(const torch::Tensor& ids, const torch::Te
 }
 
 torch::Tensor GPT2Model::decode(const torch::Tensor& ids, const torch::Tensor& positions, int64_t length,
-                                KVCache& cache) const {
+                                KVCache& cache, bool padded_length) const {
   TORCH_CHECK(ids.dim() == 1, "decode expects ids [B], got ", ids.sizes());
   TORCH_CHECK(ids.scalar_type() == torch::kInt64 && positions.scalar_type() == torch::kInt64, "ids/positions int64");
   TORCH_CHECK(positions.sizes() == ids.sizes(), "positions must match ids shape");
@@ -165,7 +165,7 @@ torch::Tensor GPT2Model::decode(const torch::Tensor& ids, const torch::Tensor& p
   const auto dev_pos = positions.to(device_);
   auto x = (torch::embedding(wte_, dev_ids) + torch::embedding(wpe_, dev_pos)).unsqueeze(1);  // [B, 1, D]
 
-  const auto allowed = build_decode_mask(dev_pos, length);
+  const auto allowed = build_decode_mask(dev_pos, length, /*always=*/padded_length);
   for (int64_t layer = 0; layer < cfg_.n_layer; ++layer) {
     x = blocks_[static_cast<size_t>(layer)].forward_decode(x, dev_pos, layer, length, allowed, cache);
   }

@@ -69,6 +69,7 @@ add_library(gpt2_core
   src/model/layers.cpp
   src/model/gpt2.cpp
   src/model/generate.cpp
+  src/model/decode_graphs.cpp
   src/scheduler/padding.cpp
   src/scheduler/static_batch.cpp
   src/scheduler/request.cpp
@@ -81,6 +82,17 @@ target_include_directories(gpt2_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(gpt2_core
   PUBLIC ${TORCH_LIBRARIES}
   PRIVATE nlohmann_json::nlohmann_json tokenizers_cpp httplib::httplib gpt2_options)
+
+# CUDA graphs (src/model/decode_graphs.cpp) need LibTorch's CUDA headers and the CUDA runtime's.
+# A CPU-only LibTorch (CI) builds the same file as a stub that reports itself unavailable.
+if(TARGET torch_cuda OR TARGET c10_cuda)
+  find_package(CUDAToolkit REQUIRED)
+  target_compile_definitions(gpt2_core PRIVATE GPT2_WITH_CUDA=1)
+  target_link_libraries(gpt2_core PRIVATE CUDA::cudart)
+  message(STATUS "gpt2: CUDA graphs enabled")
+else()
+  message(STATUS "gpt2: CPU-only LibTorch, CUDA graphs disabled")
+endif()
 
 # Tools
 add_executable(hello_tensor tools/hello_tensor.cpp)

@@ -57,10 +57,11 @@ class GPT2Model {
   // Cached decode step for slots 0..B-1 (one new token each).
   //   ids:       [B] int64, the newest token per row
   //   positions: [B] int64, that token's position in its own sequence
-  //   length:    max(positions) + 1, passed in by the caller so no GPU->CPU sync is needed here
+  //   length:    max(positions) + 1, passed in by the caller so no GPU->CPU sync is needed here;
+  //              may be larger when padded_length is set (CUDA graphs round it up to a bucket)
   // Returns logits [B, vocab].
   torch::Tensor decode(const torch::Tensor& ids, const torch::Tensor& positions, int64_t length,
-                       KVCache& cache) const;
+                       KVCache& cache, bool padded_length = false) const;
 
  private:
   torch::Tensor run(const torch::Tensor& ids, const torch::Tensor& positions, const torch::Tensor& padding_mask,

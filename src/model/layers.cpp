@@ -31,9 +31,9 @@ torch::Tensor build_attention_mask(int64_t seq_len, const torch::Tensor& padding
   return allowed;
 }
 
-torch::Tensor build_decode_mask(const torch::Tensor& positions, int64_t length) {
+torch::Tensor build_decode_mask(const torch::Tensor& positions, int64_t length, bool always) {
   TORCH_CHECK(positions.dim() == 1, "positions must be [batch]");
-  if (positions.size(0) == 1) return {};  // the single row always covers the whole cached length
+  if (positions.size(0) == 1 && !always) return {};  // the single row covers the whole cached length
   const auto keys = torch::arange(length, positions.options());
   return (keys.view({1, 1, 1, length}) <= positions.view({positions.size(0), 1, 1, 1}));
 }

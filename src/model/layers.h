@@ -23,8 +23,9 @@ double mask_fill_value(torch::Dtype dtype);
 torch::Tensor build_attention_mask(int64_t seq_len, const torch::Tensor& padding_mask, torch::Device device);
 
 // Decode-step mask [B, 1, 1, length]: row i may attend to keys 0..positions[i].
-// Returns an undefined tensor when every row attends to the whole length (nothing to mask).
-torch::Tensor build_decode_mask(const torch::Tensor& positions, int64_t length);
+// Returns an undefined tensor when every row attends to the whole length (nothing to mask),
+// unless `always` is set: a length padded past max(positions) + 1 needs the mask even for one row.
+torch::Tensor build_decode_mask(const torch::Tensor& positions, int64_t length, bool always = false);
 
 struct Linear {
   torch::Tensor weight;  // [out, in]
