@@ -149,6 +149,12 @@ def main() -> None:
                 f"--slots 32 --out {results}/bench_{dtype}.csv",
                 env=run_env,
             )
+        # The same decode steps replayed from CUDA graphs, to compare against bench_fp16.csv.
+        sh(
+            f"{build}/gpt2_bench --weights {weights} --device cuda --dtype fp16 --cuda-graphs "
+            f"--slots 32 --out {results}/bench_fp16_graphs.csv",
+            env=run_env,
+        )
 
     if not args.skip_serve:
         print("\n=== server + open-loop load ===")
