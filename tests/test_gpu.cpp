@@ -1,5 +1,6 @@
 // GPU correctness. Every test here skips when CUDA is unavailable, so the suite still runs on CPU.
 // fp32 on GPU is held to the same tolerance as CPU; fp16 is looser by design and reported, not hidden.
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -9,6 +10,7 @@
 #include <torch/torch.h>
 
 #include "io/safetensors.h"
+#include "model/decode_graphs.h"
 #include "model/generate.h"
 #include "model/gpt2.h"
 #include "scheduler/scheduler.h"
@@ -156,9 +158,11 @@ namespace {
 // Runs the prompts through the scheduler and returns what each request produced.
 std::vector<std::vector<int64_t>> run_through_scheduler(const gpt2::GPT2Model& model,
                                                         const std::vector<std::vector<int64_t>>& prompts,
-                                                        const gpt2::GenerationOptions& options) {
+                                                        const gpt2::GenerationOptions& options,
+                                                        bool cuda_graphs = false) {
   gpt2::SchedulerOptions scheduler_options;
   scheduler_options.n_slots = static_cast<int64_t>(prompts.size());
+  scheduler_options.cuda_graphs = cuda_graphs;
   gpt2::Scheduler scheduler(model, scheduler_options);
   scheduler.start();
 
@@ -230,6 +234,83 @@ TEST_F(GpuTest, SchedulerOnGpuFp16DivergesOnlyAtNearTies) {
     EXPECT_LT(gap, 1.0) << "batched fp16 picked a different token where the winner was clear";
   }
   std::cout << "[          ] " << diverged << " of " << prompts.size() << " requests diverged in fp16\n";
+}
+
+// A replayed graph must compute what the eager decode step computes on the same cache, including
+// with a padded batch (3 rows run as 4) and a padded length (keys up to 128, masked).
+TEST_F(GpuTest, CudaGraphDecodeMatchesEagerDecode) {
+  if (!gpt2::DecodeGraphs::available()) GTEST_SKIP() << "LibTorch built without CUDA";
+  for (auto* model : {gpu32_.get(), gpu16_.get()}) {
+    const bool fp16 = model == gpu16_.get();
+    SCOPED_TRACE(fp16 ? "fp16" : "fp32");
+    gpt2::KVCache cache(model->config(), 4, torch::kCUDA, fp16 ? torch::kFloat16 : torch::kFloat32);
+
+    // Capture first: capturing writes position 0 of every slot, which a prefill then overwrites.
+    gpt2::DecodeGraphs graphs(*model, cache);
+    EXPECT_EQ(graphs.capture_all(), 3 * 8);  // batch buckets 1, 2, 4 x lengths 128..1024
+    EXPECT_EQ(graphs.batch_bucket(3), 4);
+    EXPECT_EQ(graphs.length_bucket(1), 128);
+    EXPECT_EQ(graphs.length_bucket(129), 256);
+    EXPECT_EQ(graphs.length_bucket(1024), 1024);
+
+    std::vector<int64_t> ids, positions;
+    int64_t slot = 0;
+    for (const char* name : {"p0", "p2", "p4"}) {
+      const auto prompt = ref_->load(std::string(name) + ".input_ids").unsqueeze(0);
+      const auto logits = model->prefill(prompt, slot++, cache);
+      ids.push_back(logits[0].argmax(-1).item<int64_t>());
+      positions.push_back(prompt.size(1));
+    }
+    const int64_t batch = 3;
+    const int64_t length = *std::max_element(positions.begin(), positions.end()) + 1;
+    const auto ids_t = torch::tensor(ids, torch::kInt64);
+    const auto positions_t = torch::tensor(positions, torch::kInt64);
+
+    const auto eager = model->decode(ids_t, positions_t, length, cache).to(torch::kFloat32).cpu();
+    // run() pads its host inputs up to the bucket, so hand it buffers with room for 4 rows.
+    auto ids_host = torch::zeros({4}, torch::kInt64), positions_host = torch::zeros({4}, torch::kInt64);
+    ids_host.narrow(0, 0, batch).copy_(ids_t);
+    positions_host.narrow(0, 0, batch).copy_(positions_t);
+    const auto graphed = graphs.run(ids_host, positions_host, batch, length).to(torch::kFloat32).cpu();
+
+    ASSERT_EQ(graphed.sizes(), eager.sizes());
+    EXPECT_TRUE(AllClose(graphed, eager, fp16 ? 1e-2 : 1e-4, fp16 ? 1e-1 : 1e-3));
+    EXPECT_TRUE(torch::equal(graphed.argmax(-1), eager.argmax(-1))) << "graph picked a different token";
+  }
+}
+
+// End to end through the scheduler: with graphs on, each request must still produce its solo
+// output, or diverge only where the top two logits were a near-tie (the correctness contract).
+TEST_F(GpuTest, SchedulerWithCudaGraphsMatchesSoloRuns) {
+  if (!gpt2::DecodeGraphs::available()) GTEST_SKIP() << "LibTorch built without CUDA";
+  const std::vector<std::string> names = {"p0", "p1", "p2", "p4"};
+  gpt2::GenerationOptions options;
+  options.max_new_tokens = 24;
+
+  for (auto* model : {gpu32_.get(), gpu16_.get()}) {
+    const bool fp16 = model == gpu16_.get();
+    SCOPED_TRACE(fp16 ? "fp16" : "fp32");
+    gpt2::KVCache solo_cache(model->config(), 1, torch::kCUDA, fp16 ? torch::kFloat16 : torch::kFloat32);
+    std::vector<std::vector<int64_t>> prompts, expected;
+    for (const auto& name : names) {
+      prompts.push_back(to_vector(ref_->load(name + ".input_ids")));
+      expected.push_back(gpt2::generate_cached(*model, prompts.back(), options, &solo_cache).tokens);
+    }
+
+    const auto graphed = run_through_scheduler(*model, prompts, options, /*cuda_graphs=*/true);
+    for (size_t i = 0; i < prompts.size(); ++i) {
+      SCOPED_TRACE(names[i]);
+      const int64_t d = first_difference(graphed[i], expected[i]);
+      if (d < 0) continue;
+      std::vector<int64_t> prefix = prompts[i];
+      prefix.insert(prefix.end(), expected[i].begin(), expected[i].begin() + d);
+      const auto logits = model->forward(torch::tensor(prefix, torch::kInt64).unsqueeze(0))[0][-1];
+      const double gap = gpt2::test::top2_gap(logits);
+      std::cout << "[          ] " << (fp16 ? "fp16 " : "fp32 ") << names[i] << " diverged at token " << d
+                << ", top-2 gap " << gap << "\n";
+      EXPECT_LT(gap, fp16 ? 1.0 : 1e-3) << "graphs picked a different token where the winner was clear";
+    }
+  }
 }
 
 }  // namespace
