@@ -20,6 +20,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# %run in a notebook reuses modules an earlier cell imported, even after a git pull;
+# drop them so this run sees the helpers that sit next to it on disk.
+for stale in ("kaggle_sweep", "vllm_check", "plot_results"):
+    sys.modules.pop(stale, None)
 from kaggle_sweep import run_load, serving_cmd, sh  # noqa: E402
 import vllm_check  # noqa: E402
 
@@ -88,7 +92,8 @@ def main() -> None:
         print(f"\n=== {name} ===")
         port = ports[name]
         for rate in rates:
-            with serving_cmd(servers[name], envs[name], port, f"{name}, fp16", startup[name]):
+            log = results / "logs" / f"baseline_{name}_rate{rate:g}.log"
+            with serving_cmd(servers[name], envs[name], port, f"{name}, fp16", startup[name], log):
                 warm_up(port, env, APIS[name])
                 out = results / f"baseline_{name}_rate{rate:g}.csv"
                 stats = run_load(build, env, port, rate, args.duration, out, api=APIS[name])

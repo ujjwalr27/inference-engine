@@ -52,26 +52,36 @@ def serving(build: Path, weights: Path, env: dict, port: int, dtype: str, slots:
 
 
 @contextmanager
-def serving_cmd(cmd: list, env: dict, port: int, label: str, startup_timeout: int = 120):
-    """Starts any server that answers /health, waits for it, and kills its process group after."""
+def serving_cmd(cmd: list, env: dict, port: int, label: str, startup_timeout: int = 120, log: Path = None):
+    """Starts any server that answers /health, waits for it, and kills its process group after.
+
+    Server output goes to a log file, never to a pipe: nothing reads a pipe while the server runs,
+    so once its ~64 KB buffer filled, the server's next log write blocked and froze it mid-run.
+    That froze vLLM (much chattier than the engine) at 32 and 64 req/s, every later request
+    hanging until the client's 300 s timeout.
+    """
     if subprocess.run(f"curl -sf http://127.0.0.1:{port}/health", shell=True,
                       capture_output=True).returncode == 0:
         raise SystemExit(f"port {port} is already serving; restart the kernel before measuring")
     wait_for_free_port(port)
 
-    print(f"--- server: {label}")
-    server = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              start_new_session=True)
+    if log is None:
+        slug = "".join(c if c.isalnum() else "_" for c in label).strip("_")
+        log = Path("/kaggle/working/server_logs") / f"{slug}_{int(time.time())}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    print(f"--- server: {label} (log: {log})")
+    with open(log, "w") as out:
+        server = subprocess.Popen(cmd, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
     try:
         for _ in range(startup_timeout):
             if subprocess.run(f"curl -sf http://127.0.0.1:{port}/health", shell=True,
                               capture_output=True).returncode == 0:
                 break
             if server.poll() is not None:
-                raise SystemExit(f"server exited early:\n{server.stdout.read()[-2000:]}")
+                raise SystemExit(f"server exited early:\n{log.read_text(errors='replace')[-2000:]}")
             time.sleep(1)
         else:
-            raise SystemExit("server did not come up")
+            raise SystemExit(f"server did not come up:\n{log.read_text(errors='replace')[-2000:]}")
         yield
     finally:
         stop_group(server, signal.SIGTERM)
@@ -80,6 +90,9 @@ def serving_cmd(cmd: list, env: dict, port: int, label: str, startup_timeout: in
         except subprocess.TimeoutExpired:
             stop_group(server, signal.SIGKILL)
             server.wait()
+        text = log.read_text(errors="replace")
+        if "Traceback" in text or " ERROR " in text:
+            print(f"    server log reports errors (full log: {log}):\n{text[-1500:]}")
 
 
 def stop_group(server: subprocess.Popen, sig: int) -> None:

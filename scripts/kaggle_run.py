@@ -162,19 +162,21 @@ def main() -> None:
 
         for dtype in ("fp16",):
             # No shell: with shell=True, terminate() kills the shell and leaves the server running.
-            server = subprocess.Popen(
-                [str(build / "gpt2_serve"), "--weights", str(weights), "--device", "cuda", "--dtype", dtype,
-                 "--slots", str(args.slots), "--max-queue", "128", "--port", str(port)],
-                env=run_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                start_new_session=True,
-            )
+            # Output to a file, not a pipe nobody reads: a full pipe blocks the server's next write.
+            log = results / f"serve_{dtype}.log"
+            with open(log, "w") as log_file:
+                server = subprocess.Popen(
+                    [str(build / "gpt2_serve"), "--weights", str(weights), "--device", "cuda", "--dtype", dtype,
+                     "--slots", str(args.slots), "--max-queue", "128", "--port", str(port)],
+                    env=run_env, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True,
+                )
             try:
                 for _ in range(120):
                     if subprocess.run(f"curl -sf http://127.0.0.1:{port}/health", shell=True,
                                       capture_output=True).returncode == 0:
                         break
                     if server.poll() is not None:
-                        raise SystemExit(f"server exited early:\n{server.stdout.read()[-2000:]}")
+                        raise SystemExit(f"server exited early:\n{log.read_text(errors='replace')[-2000:]}")
                     time.sleep(1)
                 else:
                     raise SystemExit("server did not come up")
