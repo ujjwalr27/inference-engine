@@ -52,8 +52,8 @@ def serving(build: Path, weights: Path, env: dict, port: int, dtype: str, slots:
 
 
 @contextmanager
-def serving_cmd(cmd: list, env: dict, port: int, label: str):
-    """Starts any server that speaks the engine's HTTP API, waits for /health, and kills it after."""
+def serving_cmd(cmd: list, env: dict, port: int, label: str, startup_timeout: int = 120):
+    """Starts any server that answers /health, waits for it, and kills its process group after."""
     if subprocess.run(f"curl -sf http://127.0.0.1:{port}/health", shell=True,
                       capture_output=True).returncode == 0:
         raise SystemExit(f"port {port} is already serving; restart the kernel before measuring")
@@ -63,7 +63,7 @@ def serving_cmd(cmd: list, env: dict, port: int, label: str):
     server = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               start_new_session=True)
     try:
-        for _ in range(120):
+        for _ in range(startup_timeout):
             if subprocess.run(f"curl -sf http://127.0.0.1:{port}/health", shell=True,
                               capture_output=True).returncode == 0:
                 break
@@ -110,11 +110,20 @@ def server_stats(port: int, env: dict) -> dict:
 
 
 def run_load(build: Path, env: dict, port: int, rate: float, duration: float, out: Path,
-             prompt_min=32, prompt_max=256, max_tokens=64) -> dict:
+             prompt_min=32, prompt_max=256, max_tokens=64, api: str = "engine") -> dict:
+    load = (f"{build}/gpt2_loadgen --url http://127.0.0.1:{port} --rate {rate} --duration {duration} "
+            f"--prompt-min {prompt_min} --prompt-max {prompt_max} --max-tokens {max_tokens} --out {out}")
+    if api != "engine":  # an OpenAI-compatible server (vLLM) has no /stats to cross-check against
+        sh(f"{load} --api {api}", env=env)
+        with open(out) as f:
+            rows = list(csv.DictReader(f))
+        transport_failures = sum(1 for r in rows if r["status"] == "0")
+        print(f"    connection failures {transport_failures}")
+        return {"transport_failures": transport_failures}
+
     # Count only what this run submits: a warm-up request beforehand is not part of the load.
     before = server_stats(port, env).get("submitted", 0)
-    sh(f"{build}/gpt2_loadgen --url http://127.0.0.1:{port} --rate {rate} --duration {duration} "
-       f"--prompt-min {prompt_min} --prompt-max {prompt_max} --max-tokens {max_tokens} --out {out}", env=env)
+    sh(load, env=env)
     stats = server_stats(port, env)
     submitted = stats.get("submitted", 0) - before
     with open(out) as f:
