@@ -27,6 +27,10 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# %run in a notebook reuses modules an earlier cell imported, even after a git pull;
+# drop them so this run sees the helpers that sit next to it on disk.
+for stale in ("kaggle_sweep",):
+    sys.modules.pop(stale, None)
 from kaggle_sweep import sh, stop_group, wait_for_free_port  # noqa: E402
 
 OFFLINE_TEST = r"""
