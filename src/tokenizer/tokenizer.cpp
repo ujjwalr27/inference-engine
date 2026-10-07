@@ -65,24 +65,29 @@ size_t Tokenizer::vocab_size() const {
   return impl_->tok->GetVocabSize();
 }
 
+// Byte-level BPE decodes each token to its own bytes and the text is those bytes concatenated,
+// so decoding can restart at any character boundary. Everything up to pending_start_ has been
+// emitted and ended on a whole character, which makes the suffix after it decode to exactly the
+// text still owed. Decoding only that suffix keeps each token O(1) instead of re-decoding the
+// whole output - which grew quadratically with output length, under the tokenizer's lock that
+// every stream on the server shares.
+std::string IncrementalDecoder::pending_text() const {
+  const std::vector<int64_t> pending(ids_.begin() + static_cast<std::ptrdiff_t>(pending_start_), ids_.end());
+  return pending.empty() ? std::string{} : tokenizer_->decode(pending);
+}
+
 std::string IncrementalDecoder::push(int64_t token) {
   ids_.push_back(token);
-  // Byte-level BPE decoding is a concatenation of per-token bytes, so the text produced so far
-  // is a stable prefix: decoding everything again and taking the tail is safe (and cheap at n_ctx = 1024).
-  const std::string text = tokenizer_->decode(ids_);
-  if (text.size() < emitted_bytes_) return {};  // defensive: never go backwards
-  if (ends_with_replacement(text)) return {};   // character still incomplete, wait for more tokens
-  std::string fresh = text.substr(emitted_bytes_);
-  emitted_bytes_ = text.size();
-  return fresh;
+  std::string text = pending_text();
+  if (ends_with_replacement(text)) return {};  // character still incomplete, wait for more tokens
+  pending_start_ = ids_.size();
+  return text;
 }
 
 std::string IncrementalDecoder::flush() {
-  const std::string text = tokenizer_->decode(ids_);
-  if (text.size() <= emitted_bytes_) return {};
-  std::string rest = text.substr(emitted_bytes_);
-  emitted_bytes_ = text.size();
-  return rest;
+  std::string text = pending_text();
+  pending_start_ = ids_.size();
+  return text;
 }
 
 }  // namespace gpt2

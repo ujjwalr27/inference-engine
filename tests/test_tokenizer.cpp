@@ -2,6 +2,7 @@
 #include <atomic>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -86,6 +87,32 @@ TEST_F(TokenizerTest, IncrementalDecodeHoldsBackThenReleases) {
   rest += decoder.flush();
   EXPECT_EQ(rest, "🚀");
   EXPECT_EQ(decoder.tokens().size(), ids.size());
+}
+
+// The decoder only re-decodes the tokens since the last emitted character. Streams made mostly of
+// tokens that are partial characters on their own (lone UTF-8 bytes) are the hardest case for
+// that: the streamed text must still equal decoding everything at once.
+TEST_F(TokenizerTest, IncrementalDecodeMatchesFullDecodeOnRandomStreams) {
+  std::vector<int64_t> partial;  // tokens that decode to an incomplete character by themselves
+  for (int64_t id = 0; id < static_cast<int64_t>(tok_->vocab_size()); ++id) {
+    if (tok_->decode({id}).find("\xEF\xBF\xBD") != std::string::npos) partial.push_back(id);
+  }
+  ASSERT_GT(partial.size(), 100u);
+
+  std::mt19937 rng(7);
+  std::uniform_int_distribution<int64_t> any(0, static_cast<int64_t>(tok_->vocab_size()) - 1);
+  std::uniform_int_distribution<size_t> pick(0, partial.size() - 1);
+  std::uniform_int_distribution<int> length(1, 60);
+  for (int n = 0; n < 300; ++n) {
+    std::vector<int64_t> ids(static_cast<size_t>(length(rng)));
+    for (auto& id : ids) id = (rng() % 10 < 6) ? partial[pick(rng)] : any(rng);
+
+    gpt2::IncrementalDecoder decoder(*tok_);
+    std::string streamed;
+    for (int64_t id : ids) streamed += decoder.push(id);
+    streamed += decoder.flush();
+    ASSERT_EQ(streamed, tok_->decode(ids)) << "stream #" << n;
+  }
 }
 
 // The server shares one tokenizer between all worker threads. Each thread decodes different text,

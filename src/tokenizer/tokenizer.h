@@ -44,9 +44,13 @@ class IncrementalDecoder {
   const std::vector<int64_t>& tokens() const { return ids_; }
 
  private:
+  // Text not yet emitted, decoded from ids_[pending_start_:]. That suffix starts right after the
+  // last emitted character, so it is a few tokens long, not the whole output.
+  std::string pending_text() const;
+
   const Tokenizer* tokenizer_;
   std::vector<int64_t> ids_;
-  size_t emitted_bytes_ = 0;
+  size_t pending_start_ = 0;
 };
 
 }  // namespace gpt2
