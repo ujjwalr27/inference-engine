@@ -4,10 +4,12 @@
 //
 // Usage: gpt2_bench [--weights weights] [--device cpu|cuda] [--dtype fp32|fp16]
 //                   [--slots 32] [--iters 20] [--warmup 5] [--out results/bench.csv]
+//                   [--cuda-graphs]   decode steps replayed from CUDA graphs (model/decode_graphs.h)
 #include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -15,6 +17,7 @@
 
 #include "cache/kv_cache.h"
 #include "common/device.h"
+#include "model/decode_graphs.h"
 #include "model/gpt2.h"
 
 namespace {
@@ -55,6 +58,7 @@ int main(int argc, char** argv) {
   std::string weights = "weights", device_name = "cpu", dtype_name = "fp32", out_path;
   int64_t slots = 32;
   int iters = 20, warmup = 5;
+  bool cuda_graphs = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -70,6 +74,7 @@ int main(int argc, char** argv) {
       else if (arg == "--iters") iters = std::stoi(next());
       else if (arg == "--warmup") warmup = std::stoi(next());
       else if (arg == "--out") out_path = next();
+      else if (arg == "--cuda-graphs") cuda_graphs = true;
       else throw std::invalid_argument("unknown argument " + arg);
     } catch (const std::exception& e) {
       std::cerr << "error: " << e.what() << "\n";
@@ -81,7 +86,7 @@ int main(int argc, char** argv) {
     const auto device = gpt2::parse_device(device_name);
     const auto dtype = gpt2::parse_dtype(dtype_name);
     std::cout << gpt2::runtime_summary() << "\ndevice " << device << " dtype " << dtype_name << " slots " << slots
-              << " iters " << iters << "\n\n";
+              << " iters " << iters << (cuda_graphs ? " | cuda graphs" : "") << "\n\n";
 
     const auto model = gpt2::GPT2Model::load(weights, device, dtype);
     torch::InferenceMode guard;
@@ -101,14 +106,27 @@ int main(int argc, char** argv) {
     std::cout << "\n";
 
     // Decode: one step for `batch` rows whose caches already hold `length` tokens.
+    std::unique_ptr<gpt2::DecodeGraphs> graphs;
+    if (cuda_graphs) {
+      const auto start = Clock::now();
+      graphs = std::make_unique<gpt2::DecodeGraphs>(model, cache);
+      const auto captured = graphs->capture_all();
+      std::cout << "captured " << captured << " decode graphs in "
+                << std::chrono::duration<double>(Clock::now() - start).count() << " s\n\n";
+    }
     for (int64_t length : {128, 512, 1023}) {
       for (int64_t batch : {1, 2, 4, 8, 16, 32}) {
         if (batch > slots) continue;
         const auto ids = torch::randint(0, model.config().vocab_size, {batch},
                                         torch::TensorOptions().dtype(torch::kInt64));
         const auto positions = torch::full({batch}, length, torch::TensorOptions().dtype(torch::kInt64));
-        const double ms =
-            timed_ms(device, iters, warmup, [&] { model.decode(ids, positions, length + 1, cache); });
+        const double ms = timed_ms(device, iters, warmup, [&] {
+          if (graphs) {
+            graphs->run(ids, positions, batch, length + 1);
+          } else {
+            model.decode(ids, positions, length + 1, cache);
+          }
+        });
         rows.push_back({"decode", batch, length, ms, static_cast<double>(batch) / ms * 1000.0});
         print_row(rows.back());
       }

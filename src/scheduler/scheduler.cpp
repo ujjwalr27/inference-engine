@@ -38,6 +38,12 @@ Scheduler::Scheduler(const GPT2Model& model, const SchedulerOptions& options)
   if (model.device().is_cuda()) host_options = host_options.pinned_memory(true);
   ids_host_ = torch::empty({options_.n_slots}, host_options);
   positions_host_ = torch::empty({options_.n_slots}, host_options);
+
+  if (options_.cuda_graphs) {
+    // Capture now, while no request holds a slot: capturing writes to the cache at position 0.
+    graphs_ = std::make_unique<DecodeGraphs>(model, cache_);
+    graphs_->capture_all();
+  }
 }
 
 Scheduler::~Scheduler() { stop(); }
@@ -222,9 +228,14 @@ void Scheduler::step() {
   const auto rows = static_cast<int64_t>(batch);
   const auto device = model_.device();
   const auto decode_start = SchedClock::now();
-  const auto ids = ids_host_.narrow(0, 0, rows).to(device, /*non_blocking=*/true);
-  const auto positions = positions_host_.narrow(0, 0, rows).to(device, /*non_blocking=*/true);
-  const auto logits = model_.decode(ids, positions, length, cache_);
+  torch::Tensor logits;
+  if (graphs_) {
+    logits = graphs_->run(ids_host_, positions_host_, rows, length);
+  } else {
+    const auto ids = ids_host_.narrow(0, 0, rows).to(device, /*non_blocking=*/true);
+    const auto positions = positions_host_.narrow(0, 0, rows).to(device, /*non_blocking=*/true);
+    logits = model_.decode(ids, positions, length, cache_);
+  }
   // One device -> host transfer per step, never one per request.
   const auto next = logits.argmax(-1).to(torch::kCPU, torch::kInt64).contiguous();
   const auto acc = next.accessor<int64_t, 1>();

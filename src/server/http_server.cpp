@@ -193,6 +193,7 @@ void InferenceServer::Impl::install_routes() {
                          {"decode_ms", s.decode_ms},
                          {"busy_ms", s.busy_ms},
                          {"policy", to_string(scheduler.options().policy)},
+                         {"cuda_graphs", scheduler.options().cuda_graphs},
                          {"slots", scheduler.options().n_slots},
                          {"max_queue", scheduler.options().max_queue}}
                         .dump(),

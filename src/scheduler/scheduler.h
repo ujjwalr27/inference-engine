@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "cache/kv_cache.h"
+#include "model/decode_graphs.h"
 #include "model/generate.h"
 #include "model/gpt2.h"
 #include "scheduler/queue.h"
@@ -40,6 +41,10 @@ struct SchedulerOptions {
   // running a smaller batch. 0 means "as many as there are slots".
   int64_t static_batch_size = 0;
   std::chrono::milliseconds static_max_wait{50};
+
+  // Replay decode steps from CUDA graphs (model/decode_graphs.h). CUDA only; the graphs are
+  // captured when the scheduler is constructed, so construction takes a second or two longer.
+  bool cuda_graphs = false;
 };
 
 struct SchedulerStats {
@@ -100,6 +105,7 @@ class Scheduler {
   SchedulerOptions options_;
   KVCache cache_;
   RequestQueue queue_;
+  std::unique_ptr<DecodeGraphs> graphs_;  // set when options_.cuda_graphs
 
   std::thread thread_;
   std::atomic<bool> running_{false};
