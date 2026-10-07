@@ -4,6 +4,10 @@
 // Usage: gpt2_loadgen [--url http://127.0.0.1:8080] [--rate 4] [--duration 30]
 //                     [--prompt-min 16] [--prompt-max 128] [--max-tokens 32]
 //                     [--stream on|off] [--out results/run.csv] [--seed 1]
+//                     [--api engine|openai] [--model gpt2]
+//
+// --api openai drives an OpenAI-compatible /v1/completions server (vLLM) with the same token-id
+// prompts, so the same load can be compared across servers.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -55,6 +59,8 @@ struct Options {
   bool stream = true;
   std::string out;
   uint32_t seed = 1;
+  bool openai = false;         // --api openai: POST /v1/completions instead of /v1/generate
+  std::string model = "gpt2";  // the "model" field an OpenAI-compatible server requires
 };
 
 // Random token IDs: the engine's cost depends on token counts, not on the text making sense.
@@ -66,15 +72,77 @@ std::vector<int64_t> random_prompt(std::mt19937& rng, int64_t min_len, int64_t m
   return prompt;
 }
 
+// Every request generates exactly max_tokens on every server, so they all do the same work.
+json request_body(const Options& options, const std::vector<int64_t>& prompt) {
+  if (!options.openai) {
+    return json{{"token_ids", prompt}, {"max_tokens", options.max_tokens}, {"stream", options.stream},
+                {"stop_on_eos", false}};
+  }
+  json body{{"model", options.model}, {"prompt", prompt}, {"max_tokens", options.max_tokens},
+            {"temperature", 0}, {"ignore_eos", true}, {"stream", options.stream}};
+  if (options.stream) body["stream_options"] = {{"include_usage", true}};  // exact token count at the end
+  return body;
+}
+
+// OpenAI-style stream: "data: {json}\n\n" events, a final usage event, then "data: [DONE]".
+// Events can be split across network reads, so complete ones are cut out of a buffer.
+void send_openai_stream(httplib::Client& client, const json& body, Record& record, Clock::time_point sent) {
+  std::string buffer;
+  int64_t chunks = 0, usage_tokens = -1;
+  auto result = client.Post(
+      "/v1/completions", httplib::Headers{}, body.dump(), "application/json", [&](const char* data, size_t len) {
+        buffer.append(data, len);
+        size_t end;
+        while ((end = buffer.find("\n\n")) != std::string::npos) {
+          const std::string event = buffer.substr(0, end);
+          buffer.erase(0, end + 2);
+          if (event.rfind("data: ", 0) != 0 || event == "data: [DONE]") continue;
+          try {
+            const auto j = json::parse(event.substr(6));
+            if (j.contains("choices") && !j["choices"].empty()) {
+              if (record.ttft_ms < 0) record.ttft_ms = ms_between(sent, Clock::now());
+              ++chunks;
+            }
+            if (j.contains("usage") && j["usage"].is_object()) {
+              usage_tokens = j["usage"].value("completion_tokens", int64_t{-1});
+            }
+          } catch (const std::exception&) {
+          }
+        }
+        return true;
+      });
+  record.done_ms = ms_between(sent, Clock::now());
+  record.output_tokens = usage_tokens >= 0 ? usage_tokens : chunks;
+  record.status = result ? result->status : 0;
+}
+
 void send_one(const Options& options, Record& record, std::vector<int64_t> prompt, Clock::time_point run_start) {
   httplib::Client client(options.url);
   client.set_read_timeout(300, 0);
   client.set_write_timeout(30, 0);
 
-  const json body{{"token_ids", prompt}, {"max_tokens", options.max_tokens}, {"stream", options.stream}};
+  const json body = request_body(options, prompt);
   record.prompt_tokens = static_cast<int64_t>(prompt.size());
   const auto sent = Clock::now();
   record.send_ms = ms_between(run_start, sent);
+
+  if (options.openai) {
+    if (options.stream) {
+      send_openai_stream(client, body, record, sent);
+      return;
+    }
+    auto result = client.Post("/v1/completions", body.dump(), "application/json");
+    record.done_ms = ms_between(sent, Clock::now());
+    record.ttft_ms = record.done_ms;
+    record.status = result ? result->status : 0;
+    if (result && result->status == 200) {
+      try {
+        record.output_tokens = json::parse(result->body).at("usage").at("completion_tokens").get<int64_t>();
+      } catch (const std::exception&) {
+      }
+    }
+    return;
+  }
 
   if (options.stream) {
     bool first_seen = false;
@@ -176,6 +244,12 @@ int main(int argc, char** argv) {
       else if (arg == "--stream") options.stream = (next() == "on");
       else if (arg == "--out") options.out = next();
       else if (arg == "--seed") options.seed = static_cast<uint32_t>(std::stoul(next()));
+      else if (arg == "--model") options.model = next();
+      else if (arg == "--api") {
+        const std::string api = next();
+        if (api != "engine" && api != "openai") throw std::invalid_argument("--api must be engine or openai");
+        options.openai = api == "openai";
+      }
       else throw std::invalid_argument("unknown argument " + arg);
     } catch (const std::exception& e) {
       std::cerr << "error: " << e.what() << "\n";
@@ -198,7 +272,7 @@ int main(int argc, char** argv) {
                                         std::chrono::duration<double>(options.duration));
 
   std::cout << "open-loop load: " << options.rate << " req/s for " << options.duration << " s -> " << options.url
-            << " (stream " << (options.stream ? "on" : "off") << ")\n";
+            << " (stream " << (options.stream ? "on" : "off") << (options.openai ? ", OpenAI API" : "") << ")\n";
 
   uint64_t id = 0;
   auto next_arrival = run_start;
