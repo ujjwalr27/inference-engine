@@ -1,11 +1,19 @@
 #include "scheduler/scheduler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <thread>
 
 namespace gpt2 {
+namespace {
+
+double ms_since(SchedClock::time_point start, SchedClock::time_point end = SchedClock::now()) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+}  // namespace
 
 const char* to_string(BatchingPolicy policy) {
   return policy == BatchingPolicy::Static ? "static" : "continuous";
@@ -79,7 +87,13 @@ std::shared_ptr<Request> Scheduler::submit(std::vector<int64_t> prompt, const Ge
 
 void Scheduler::run() {
   while (running_.load()) {
+    const auto iteration_start = SchedClock::now();
     admit();
+    const auto admitted = SchedClock::now();
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      stats_.busy_ms += ms_since(iteration_start, admitted);
+    }
     if (active_.empty()) {
       if (queue_.size() == 0) {
         queue_.wait_for_work(options_.idle_wait);
@@ -90,6 +104,8 @@ void Scheduler::run() {
       continue;
     }
     step();
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    stats_.busy_ms += ms_since(admitted);
   }
 
   // Shutting down: tell everyone still in flight, in the queue and in a slot.
@@ -171,6 +187,8 @@ void Scheduler::admit() {
       std::lock_guard<std::mutex> lock(stats_mutex_);
       ++stats_.admitted;
       ++stats_.generated_tokens;
+      stats_.prefill_ms += ms_since(request->t_prefill_start, request->t_first_token);
+      stats_.prefill_tokens += request->prompt.size();
       stats_.max_batch = std::max<int64_t>(stats_.max_batch, static_cast<int64_t>(active_.size()));
       stats_.active = static_cast<int64_t>(active_.size());
       stats_.queued = queue_.size();
@@ -203,12 +221,14 @@ void Scheduler::step() {
 
   const auto rows = static_cast<int64_t>(batch);
   const auto device = model_.device();
+  const auto decode_start = SchedClock::now();
   const auto ids = ids_host_.narrow(0, 0, rows).to(device, /*non_blocking=*/true);
   const auto positions = positions_host_.narrow(0, 0, rows).to(device, /*non_blocking=*/true);
   const auto logits = model_.decode(ids, positions, length, cache_);
   // One device -> host transfer per step, never one per request.
   const auto next = logits.argmax(-1).to(torch::kCPU, torch::kInt64).contiguous();
   const auto acc = next.accessor<int64_t, 1>();
+  const double decode_ms = ms_since(decode_start);
 
   for (size_t i = 0; i < batch; ++i) {
     auto& request = active_[i];
@@ -222,6 +242,7 @@ void Scheduler::step() {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     ++stats_.decode_steps;
     stats_.generated_tokens += batch;
+    stats_.decode_ms += decode_ms;
   }
 
   // Walk backwards so compaction never skips a row.

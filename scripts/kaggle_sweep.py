@@ -151,6 +151,12 @@ def run_load(build: Path, env: dict, port: int, rate: float, duration: float, ou
     print(f"    max_batch {stats['max_batch']}/{stats['slots']} | decode steps {stats['decode_steps']} | "
           f"tokens {stats['generated_tokens']} | rejected {stats['rejected']} | "
           f"connection failures {transport_failures}")
+    if stats.get("decode_steps") and "decode_ms" in stats:
+        # Where the scheduler's time went (cumulative since the server started, warm-up included).
+        other = stats["busy_ms"] - stats["prefill_ms"] - stats["decode_ms"]
+        print(f"    time: decode {stats['decode_ms'] / stats['decode_steps']:.2f} ms/step "
+              f"({stats['decode_ms'] / 1000:.1f} s) | prefill {stats['prefill_ms'] / 1000:.1f} s for "
+              f"{stats['prefill_tokens']} tokens | bookkeeping {other / 1000:.1f} s")
     return {**stats, "transport_failures": transport_failures}
 
 

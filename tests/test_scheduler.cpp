@@ -97,7 +97,16 @@ TEST_F(SchedulerTest, SingleRequestMatchesSoloGeneration) {
 
   EXPECT_EQ(tokens, expected);
   EXPECT_EQ(request->finish_reason, gpt2::FinishReason::MaxTokens);
-  EXPECT_EQ(scheduler.stats().finished, 1u);
+  const auto stats = scheduler.stats();
+  EXPECT_EQ(stats.finished, 1u);
+
+  // The time split must account for the work: one prefill of the prompt, 19 decode steps,
+  // and both inside the busy time.
+  EXPECT_EQ(stats.prefill_tokens, prompt.size());
+  EXPECT_GT(stats.prefill_ms, 0.0);
+  EXPECT_EQ(stats.decode_steps, 19u);
+  EXPECT_GT(stats.decode_ms, 0.0);
+  EXPECT_GE(stats.busy_ms, stats.prefill_ms + stats.decode_ms);
 }
 
 // The Phase 4 headline test.

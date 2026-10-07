@@ -54,6 +54,15 @@ struct SchedulerStats {
   int64_t active = 0;
   size_t queued = 0;
   uint64_t batches = 0;     // static policy: batches formed so far
+
+  // Where the scheduler thread's time goes, cumulative, in milliseconds. Prefill and decode each
+  // end in a device->host copy that waits for the GPU, so they include the GPU work itself, not
+  // just the kernel launches. busy_ms - prefill_ms - decode_ms is bookkeeping: admitting,
+  // publishing tokens, finishing requests and compacting their slots.
+  double prefill_ms = 0;        // prompt forward passes, first token included
+  uint64_t prefill_tokens = 0;
+  double decode_ms = 0;         // decode steps: inputs in, forward, argmax, tokens out
+  double busy_ms = 0;           // every loop iteration except the time spent idle or gathering
 };
 
 // Continuous batching. One thread owns the model and the KV cache, so nothing else locks them.

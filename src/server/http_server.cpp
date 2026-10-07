@@ -188,6 +188,10 @@ void InferenceServer::Impl::install_routes() {
                          {"active", s.active},
                          {"queued", s.queued},
                          {"batches", s.batches},
+                         {"prefill_ms", s.prefill_ms},
+                         {"prefill_tokens", s.prefill_tokens},
+                         {"decode_ms", s.decode_ms},
+                         {"busy_ms", s.busy_ms},
                          {"policy", to_string(scheduler.options().policy)},
                          {"slots", scheduler.options().n_slots},
                          {"max_queue", scheduler.options().max_queue}}

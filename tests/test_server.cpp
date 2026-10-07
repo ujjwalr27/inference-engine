@@ -109,6 +109,9 @@ TEST_F(ServerTest, HealthAndStats) {
   const auto body = json::parse(stats->body);
   EXPECT_EQ(body.at("slots"), 4);
   EXPECT_EQ(body.at("submitted"), 0);
+  for (const char* key : {"prefill_ms", "prefill_tokens", "decode_ms", "busy_ms"}) {
+    EXPECT_TRUE(body.contains(key)) << key;
+  }
 }
 
 TEST_F(ServerTest, GenerateMatchesSoloGeneration) {
