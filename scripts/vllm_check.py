@@ -6,14 +6,15 @@ is built against and links at run time, so it goes into a separate environment
 
 Checks, in order, stopping at the first failure:
   1. install   vLLM installs and sees the GPU
-  2. offline   it loads GPT-2 in fp16 and generates; a rough batch throughput figure
-  3. server    `vllm serve` starts and streams a completion for token ids, which is how a
+  2. download  GPT-2 into a local folder; vLLM then loads from that folder with the Hub offline
+  3. offline   it loads GPT-2 in fp16 and generates; a rough batch throughput figure
+  4. server    `vllm serve` starts and streams a completion for token ids, which is how a
                baseline would drive it (same prompts as our load generator, no re-tokenizing)
 
 Usage in a notebook cell:
     %run /kaggle/working/gpt2-engine/scripts/vllm_check.py
 
-Flags: --venv PATH --port 8299 --version X.Y.Z (pin vLLM; default: latest)
+Flags: --venv PATH --port 8299 --model REPO --version X.Y.Z (pin vLLM; default: latest)
 """
 import argparse
 import json
@@ -29,10 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kaggle_sweep import sh, stop_group, wait_for_free_port  # noqa: E402
 
 OFFLINE_TEST = r"""
-import time, torch, vllm
+import sys, time, torch, vllm
 from vllm import LLM, SamplingParams
 print(f"vllm {vllm.__version__} | torch {torch.__version__} | gpu {torch.cuda.get_device_name(0)}", flush=True)
-llm = LLM(model="gpt2", dtype="float16", gpu_memory_utilization=0.5, max_model_len=1024, seed=0)
+llm = LLM(model=sys.argv[1], dtype="float16", gpu_memory_utilization=0.5, max_model_len=1024, seed=0)
 greedy = SamplingParams(temperature=0.0, max_tokens=64, ignore_eos=True)
 
 out = llm.generate(["The capital of France is"], greedy)[0]
@@ -65,12 +66,52 @@ def install(venv: Path, version: str) -> None:
        f"'| cuda', torch.cuda.is_available())\"")
 
 
-def offline(venv: Path) -> None:
-    result = subprocess.run([str(venv_python(venv)), "-c", OFFLINE_TEST], text=True, capture_output=True)
+# The full repo id, not the legacy alias "gpt2": recent huggingface_hub fetches through Xet, and
+# Xet's read-token request for the alias returned 404 on Kaggle (2026-10-07). Plain HTTP is
+# plenty for a 500 MB model and takes that whole failure mode away.
+DOWNLOAD = r"""
+import sys
+from huggingface_hub import snapshot_download
+path = snapshot_download(sys.argv[1], allow_patterns=[
+    "config.json", "generation_config.json", "model.safetensors",
+    "tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"])
+print(path)
+"""
+
+
+def download(venv: Path, repo: str) -> Path:
+    env = dict(os.environ, HF_HUB_DISABLE_XET="1")
+    result = subprocess.run([str(venv_python(venv)), "-c", DOWNLOAD, repo], text=True, capture_output=True, env=env)
+    if result.returncode != 0:
+        print(result.stderr[-6000:])
+        raise SystemExit(f"could not download {repo}")
+    path = Path(result.stdout.strip().splitlines()[-1])
+    print(f"{repo} -> {path}")
+    return path
+
+
+def offline_env() -> dict:
+    # From here on vLLM reads only the local folder; a hidden Hub request would fail loudly.
+    return dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+
+
+def first_error(stderr: str) -> str:
+    """vLLM's engine runs in a child process, so its root cause sits well above the final
+    traceback. Show the first error-looking line as well as the tail."""
+    for line in stderr.splitlines():
+        if "Error" in line or "error:" in line:
+            return line.strip()
+    return ""
+
+
+def offline(venv: Path, model: Path) -> None:
+    result = subprocess.run([str(venv_python(venv)), "-c", OFFLINE_TEST, str(model)], text=True,
+                            capture_output=True, env=offline_env())
     lines = [ln for ln in result.stdout.splitlines() if ln.startswith(("vllm ", "sample:", "batch:"))]
     print("\n".join(lines))
     if result.returncode != 0:
-        print(result.stderr[-4000:])
+        print(result.stderr[-6000:])
+        print(f"\nfirst error: {first_error(result.stderr)}")
         raise SystemExit("offline generation failed")
 
 
@@ -79,14 +120,16 @@ def get(url: str, timeout: float = 5.0) -> int:
         return r.status
 
 
-def server(venv: Path, port: int) -> None:
+def server(venv: Path, model: Path, port: int) -> None:
     wait_for_free_port(port)
     log = Path("/kaggle/working/vllm_server.log")
-    cmd = [str(venv / "bin" / "vllm"), "serve", "gpt2", "--dtype", "float16", "--port", str(port),
+    cmd = [str(venv / "bin" / "vllm"), "serve", str(model), "--served-model-name", "gpt2",
+           "--dtype", "float16", "--port", str(port),
            "--gpu-memory-utilization", "0.5", "--max-model-len", "1024"]
     print("$ " + " ".join(cmd))
     with open(log, "w") as out:
-        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                                env=offline_env())
     try:
         start = time.time()
         while True:  # first start compiles and captures CUDA graphs: minutes, not seconds
@@ -133,6 +176,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--venv", default="/kaggle/working/vllm-env")
     ap.add_argument("--port", type=int, default=8299)
+    ap.add_argument("--model", default="openai-community/gpt2")
     ap.add_argument("--version", default="", help="pin a vLLM version, e.g. one that still supports the T4")
     args = ap.parse_args()
     venv = Path(args.venv)
@@ -140,10 +184,12 @@ def main() -> None:
 
     print("=== 1. install ===")
     install(venv, args.version)
-    print("\n=== 2. offline generation (fp16) ===")
-    offline(venv)
-    print("\n=== 3. OpenAI-compatible server, streaming ===")
-    server(venv, args.port)
+    print("\n=== 2. download ===")
+    model = download(venv, args.model)
+    print("\n=== 3. offline generation (fp16) ===")
+    offline(venv, model)
+    print("\n=== 4. OpenAI-compatible server, streaming ===")
+    server(venv, model, args.port)
     print("\n=== verdict: vLLM runs GPT-2 on this GPU; a baseline is feasible ===")
 
 
