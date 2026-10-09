@@ -16,12 +16,17 @@ Tensor names:
 
 All linear weights are [out, in] (Conv1D weights transposed), so C++ uses torch::linear directly.
 
-Usage: python scripts/export_weights.py [--model gpt2] [--out weights]
+Usage: python scripts/export_weights.py [--model openai-community/gpt2] [--out weights]
 """
 import argparse
 import json
 import math
+import os
 from pathlib import Path
+
+# Hugging Face's Xet transfer backend has answered 404 for GPT-2's files; plain HTTPS works.
+# Set before transformers imports huggingface_hub, which reads it once.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 import torch
 import torch.nn.functional as F
@@ -102,7 +107,7 @@ def reference_forward(w: dict[str, torch.Tensor], cfg: dict, ids: torch.Tensor) 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="gpt2")
+    ap.add_argument("--model", default="openai-community/gpt2")
     ap.add_argument("--out", default="weights")
     args = ap.parse_args()
 

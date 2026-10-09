@@ -11,11 +11,16 @@ and for prompt 0 only (short, so it stays small):
 plus <out>/reference.json with the prompt texts and settings, and
 <out>/tokenizer_cases.json with encode/decode cases for the C++ tokenizer.
 
-Usage: python scripts/reference.py [--model gpt2] [--out weights]
+Usage: python scripts/reference.py [--model openai-community/gpt2] [--out weights]
 """
 import argparse
 import json
+import os
 from pathlib import Path
+
+# Hugging Face's Xet transfer backend has answered 404 for GPT-2's files; plain HTTPS works.
+# Set before transformers imports huggingface_hub, which reads it once.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 import torch
 from safetensors.torch import save_file
@@ -78,7 +83,7 @@ def tokenizer_cases(tokenizer, seed: int = 7, n: int = 2000) -> list[dict]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="gpt2")
+    ap.add_argument("--model", default="openai-community/gpt2")
     ap.add_argument("--out", default="weights")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--greedy-tokens", type=int, default=50)
