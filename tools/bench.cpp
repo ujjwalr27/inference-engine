@@ -11,7 +11,8 @@
 //   prefill         one prompt of `length` tokens
 //   prefill_solo    `batch` prompts of `length` tokens, one pass each, the first token read back
 //                   after each (the scheduler with --solo-prefill)
-//   prefill_packed  the same prompts in one packed pass, first tokens read back once (the default)
+//   prefill_packed  the same prompts in one packed pass, first tokens read back once
+//   prefill_padded  the same prompts right-padded into one [n, longest] batch, read back once
 //   decode          one step for `batch` rows whose caches hold `length` tokens
 #include <chrono>
 #include <fstream>
@@ -134,10 +135,15 @@ int main(int argc, char** argv) {
       const double packed_ms = timed_ms(device, iters, warmup, [&] {
         model.prefill_packed(prompts, 0, cache).argmax(-1).to(torch::kCPU);
       });
+      const double padded_ms = timed_ms(device, iters, warmup, [&] {
+        model.prefill_padded(prompts, 0, cache).argmax(-1).to(torch::kCPU);
+      });
       const double tokens = static_cast<double>(n * kPromptLength);
       rows.push_back({"prefill_solo", n, kPromptLength, solo_ms, tokens / solo_ms * 1000.0});
       print_row(rows.back());
       rows.push_back({"prefill_packed", n, kPromptLength, packed_ms, tokens / packed_ms * 1000.0});
+      print_row(rows.back());
+      rows.push_back({"prefill_padded", n, kPromptLength, padded_ms, tokens / padded_ms * 1000.0});
       print_row(rows.back());
     }
     std::cout << "\n";
