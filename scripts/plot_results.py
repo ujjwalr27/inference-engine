@@ -365,36 +365,40 @@ def chart_decode_step(results: Path, out: Path, context: str) -> None:
     save(fig, out)
 
 
-def chart_prefill_packing(results: Path, out: Path, context: str) -> None:
-    """gpt2_bench: n prompts prefilled one pass each (with a read-back after each) against one packed pass."""
+def chart_prefill_batching(results: Path, out: Path, context: str) -> None:
+    """gpt2_bench: n prompts prefilled one pass each (read back after each), right-padded into one
+    batch (the scheduler's layout), or packed end to end in one row."""
     path = next((results / f"bench_{run}.csv" for run in ("fp16_graphs", "fp16")
                  if (results / f"bench_{run}.csv").exists()), None)
     if path is None:
         return
     bench = pd.read_csv(path)
-    solo = bench[bench["phase"] == "prefill_solo"].set_index("batch")["ms"]
-    packed = bench[bench["phase"] == "prefill_packed"].set_index("batch")["ms"]
-    counts = sorted(set(solo.index) & set(packed.index))
+    phases = {phase: bench[bench["phase"] == phase].set_index("batch")["ms"]
+              for phase in ("prefill_solo", "prefill_padded", "prefill_packed")}
+    counts = sorted(set.intersection(*(set(v.index) for v in phases.values())))
     if not counts:
         return
-    length = int(bench[bench["phase"] == "prefill_packed"]["length"].iloc[0])
-    fig, ax = plt.subplots(figsize=(8, 4.4))
-    width = 0.38
-    for j, (series, color, label) in enumerate(((solo, PREVIOUS, "one pass per prompt"),
-                                                (packed, SLOT_1, "one packed pass"))):
-        xs = [i + (j - 0.5) * width for i in range(len(counts))]
-        values = [series[n] for n in counts]
+    length = int(bench[bench["phase"] == "prefill_padded"]["length"].iloc[0])
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    width = 0.27
+    # Aqua is under 3:1 on the surface, but every bar carries its value.
+    bars = (("prefill_solo", PREVIOUS, "one pass per prompt"), ("prefill_padded", SLOT_1, "one padded batch"),
+            ("prefill_packed", SLOT_3, "packed into one row"))
+    for j, (phase, color, label) in enumerate(bars):
+        xs = [i + (j - 1) * width for i in range(len(counts))]
+        values = [phases[phase][n] for n in counts]
         ax.bar(xs, values, width=width, color=color, edgecolor=SURFACE, linewidth=2, label=label)
         for x, v in zip(xs, values):
-            ax.text(x, v, f"{v:.1f}", ha="center", va="bottom", fontsize=9, color=INK)
+            ax.text(x, v, f"{v:.0f}" if v >= 100 else f"{v:.1f}", ha="center", va="bottom", fontsize=8, color=INK)
     ax.set_xticks(range(len(counts)), [str(n) for n in counts])
     ax.set_xlabel(f"prompts admitted in the same step ({length} tokens each)")
     ax.set_ylabel("ms until every first token is on the host")
     ax.legend(loc="upper left")
     tidy(ax)
     n = counts[-1]
-    fig.suptitle(f"Packing {n} prompts into one prefill pass: {packed[n]:.1f} ms instead of {solo[n]:.1f} ms "
-                 f"({solo[n] / packed[n]:.1f}x)", x=0.01, ha="left", fontsize=12, fontweight="bold")
+    solo, padded = phases["prefill_solo"][n], phases["prefill_padded"][n]
+    fig.suptitle(f"Prefilling {n} prompts as one padded batch: {padded:.1f} ms instead of {solo:.1f} ms "
+                 f"({solo / padded:.1f}x)", x=0.01, ha="left", fontsize=12, fontweight="bold")
     footnote(fig, context.split(" · ")[0] + f" · {bench['dtype'].iloc[0]} · gpt2_bench, device synchronised")
     fig.tight_layout(rect=(0, 0.05, 1, 0.93))
     save(fig, out)
@@ -575,7 +579,7 @@ def cmd_readme(args) -> None:
     chart_decode_step(results, out_dir / "decode_step_vs_batch.png", context)
     chart_baseline(results, out_dir / "engine_vs_huggingface.png", context)
     chart_engine_vs_vllm(results, out_dir / "engine_vs_vllm.png", context)
-    chart_prefill_packing(results, out_dir / "prefill_packing.png", context)
+    chart_prefill_batching(results, out_dir / "prefill_batching.png", context)
     chart_batched_prefill(results, out_dir / "batched_prefill.png", context)
 
 
