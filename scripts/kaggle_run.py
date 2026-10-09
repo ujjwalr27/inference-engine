@@ -2,7 +2,8 @@
 
 Paste into a Kaggle notebook (GPU T4, Internet on):
 
-    !git clone -q --recursive https://github.com/<you>/gpt2-engine /kaggle/working/gpt2-engine
+    !git clone -q https://github.com/ujjwalr27/inference-engine /kaggle/working/gpt2-engine
+    !git -C /kaggle/working/gpt2-engine submodule update --init -q third_party/tokenizers-cpp
     %run /kaggle/working/gpt2-engine/scripts/kaggle_run.py
 
 What it does, in order:
@@ -149,12 +150,14 @@ def main() -> None:
                 f"--slots 32 --out {results}/bench_{dtype}.csv",
                 env=run_env,
             )
-        # The same decode steps replayed from CUDA graphs, to compare against bench_fp16.csv.
-        sh(
-            f"{build}/gpt2_bench --weights {weights} --device cuda --dtype fp16 --cuda-graphs "
-            f"--slots 32 --out {results}/bench_fp16_graphs.csv",
-            env=run_env,
-        )
+        # The same decode steps replayed from CUDA graphs, to compare against bench_fp16.csv: at the
+        # default 64-token length buckets, and at the 128-token ones measured on 2026-10-08.
+        for step, suffix in ((64, ""), (128, "128")):
+            sh(
+                f"{build}/gpt2_bench --weights {weights} --device cuda --dtype fp16 --cuda-graphs "
+                f"--graph-length-step {step} --slots 32 --out {results}/bench_fp16_graphs{suffix}.csv",
+                env=run_env,
+            )
 
     if not args.skip_serve:
         print("\n=== server + open-loop load ===")

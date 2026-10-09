@@ -5,7 +5,10 @@ Runs, in order:
   2. request-rate sweep, static batching       -> the comparison that motivates the project
   3. fp32 vs fp16 at one rate                  -> precision cost
   4. slot-count sweep                          -> how throughput scales with concurrency
-then writes the charts with scripts/plot_results.py.
+  5. static vs continuous, mixed output lengths -> what static batching costs when requests
+                                                  finish at different times
+then writes the charts with scripts/plot_results.py. Servers run with their defaults: CUDA graphs
+and batched prefill on.
 
 Each configuration gets its own server process, started in its own process group and killed
 afterwards: a leftover server would share the port (cpp-httplib sets SO_REUSEPORT) and silently
@@ -14,7 +17,7 @@ blend two engines into one measurement.
 Usage in a notebook cell:
     %run /kaggle/working/gpt2-engine/scripts/kaggle_sweep.py
 
-Flags: --rates 2,8,16,32,64 --duration 20 --slots 32 --quick --repeat N
+Flags: --rates 2,8,16,32,64 --duration 20 --slots 32 --quick
 """
 import argparse
 import csv
@@ -123,9 +126,11 @@ def server_stats(port: int, env: dict) -> dict:
 
 
 def run_load(build: Path, env: dict, port: int, rate: float, duration: float, out: Path,
-             prompt_min=32, prompt_max=256, max_tokens=64, api: str = "engine") -> dict:
+             prompt_min=32, prompt_max=256, max_tokens=64, api: str = "engine", max_tokens_min: int = 0) -> dict:
     load = (f"{build}/gpt2_loadgen --url http://127.0.0.1:{port} --rate {rate} --duration {duration} "
             f"--prompt-min {prompt_min} --prompt-max {prompt_max} --max-tokens {max_tokens} --out {out}")
+    if max_tokens_min:
+        load += f" --max-tokens-min {max_tokens_min}"
     if api != "engine":  # an OpenAI-compatible server (vLLM) has no /stats to cross-check against
         sh(f"{load} --api {api}", env=env)
         with open(out) as f:
@@ -156,7 +161,8 @@ def run_load(build: Path, env: dict, port: int, rate: float, duration: float, ou
         other = stats["busy_ms"] - stats["prefill_ms"] - stats["decode_ms"]
         print(f"    time: decode {stats['decode_ms'] / stats['decode_steps']:.2f} ms/step "
               f"({stats['decode_ms'] / 1000:.1f} s) | prefill {stats['prefill_ms'] / 1000:.1f} s for "
-              f"{stats['prefill_tokens']} tokens | bookkeeping {other / 1000:.1f} s")
+              f"{stats['prefill_tokens']} tokens in {stats.get('prefill_passes', '?')} passes | "
+              f"bookkeeping {other / 1000:.1f} s")
     return {**stats, "transport_failures": transport_failures}
 
 
@@ -169,6 +175,7 @@ def main() -> None:
     ap.add_argument("--slots", type=int, default=32)
     ap.add_argument("--slot-sweep", default="1,4,8,16,32")
     ap.add_argument("--compare-rate", type=float, default=16.0)
+    ap.add_argument("--varied-tokens", default="8,128", help="output length range for section 5")
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument("--quick", action="store_true", help="fewer points, 10 s each")
     args = ap.parse_args()
@@ -216,6 +223,15 @@ def main() -> None:
             out = results / f"slots_{slots}.csv"
             stats = run_load(build, env, port, max(rates), duration, out)
             summary.append({"kind": "slots", "slots_config": slots, **stats})
+
+    low, high = (int(t) for t in args.varied_tokens.split(","))
+    print(f"\n=== 5. static vs continuous, {low}-{high} output tokens at {args.compare_rate:g} req/s ===")
+    for policy in ("static", "continuous"):
+        with serving(build, weights, env, port, "fp16", args.slots, policy):
+            out = results / f"varied_{policy}.csv"
+            stats = run_load(build, env, port, args.compare_rate, duration, out, max_tokens=high,
+                             max_tokens_min=low)
+            summary.append({"kind": "varied", "policy": policy, "rate": args.compare_rate, **stats})
 
     (results / "sweep_summary.json").write_text(json.dumps(summary, indent=2))
 

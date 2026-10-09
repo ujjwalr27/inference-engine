@@ -11,7 +11,13 @@ vLLM runs from its own environment (scripts/vllm_check.py creates it) with at mo
 sequences in flight, the same concurrency budget as the engine, and is driven through its
 OpenAI-compatible API with the same token-id prompts.
 
-Flags: --rates 1,2,4,8 --duration 20 --servers engine,engine_graphs,huggingface,vllm
+The engine is measured in up to three configurations, so each optimisation is compared within
+one session:
+  engine          no CUDA graphs, one prefill pass per request (the Phase 7 engine)
+  engine_graphs   + CUDA graphs at 128-token length buckets (2026-10-08)
+  engine_full     the defaults: CUDA graphs at 64-token buckets + batched prefill
+
+Flags: --rates 1,2,4,8 --duration 20 --servers engine,engine_graphs,engine_full,huggingface,vllm
 """
 import argparse
 import json
@@ -28,8 +34,8 @@ from kaggle_sweep import run_load, serving_cmd, sh  # noqa: E402
 import vllm_check  # noqa: E402
 
 # Which HTTP API each server speaks (gpt2_loadgen --api).
-# engine_graphs is the engine with --cuda-graphs, so both can be measured in one session.
-APIS = {"engine": "engine", "engine_graphs": "engine", "huggingface": "engine", "vllm": "openai"}
+APIS = {"engine": "engine", "engine_graphs": "engine", "engine_full": "engine", "huggingface": "engine",
+        "vllm": "openai"}
 
 
 def warm_up(port: int, env: dict, api: str) -> None:
@@ -66,20 +72,23 @@ def main() -> None:
     # Each server gets its own port. Rebinding one port straight after a different server released
     # it failed on Kaggle with "Address already in use", even though nothing answered on it any more.
     ports = {"engine": args.port, "huggingface": args.port + 100, "vllm": args.port + 200,
-             "engine_graphs": args.port + 300}
+             "engine_graphs": args.port + 300, "engine_full": args.port + 400}
+    engine = [str(build / "gpt2_serve"), "--weights", str(weights), "--device", "cuda", "--dtype", "fp16",
+              "--slots", str(args.slots), "--max-queue", "256"]
     servers = {
-        "engine": [str(build / "gpt2_serve"), "--weights", str(weights), "--device", "cuda", "--dtype", "fp16",
-                   "--slots", str(args.slots), "--max-queue", "256", "--port", str(ports["engine"])],
+        "engine": engine + ["--port", str(ports["engine"]), "--no-cuda-graphs", "--solo-prefill"],
+        "engine_graphs": engine + ["--port", str(ports["engine_graphs"]), "--cuda-graphs",
+                                   "--graph-length-step", "128", "--solo-prefill"],
+        "engine_full": engine + ["--port", str(ports["engine_full"])],
         "huggingface": [sys.executable, str(repo / "scripts/hf_server.py"), "--dtype", "fp16",
                         "--port", str(ports["huggingface"]), "--max-queue", "256"],
     }
-    servers["engine_graphs"] = servers["engine"][:-1] + [str(ports["engine_graphs"]), "--cuda-graphs"]
     selected = [s.strip() for s in args.servers.split(",") if s.strip()]
     unknown = set(selected) - set(servers) - {"vllm"}
     if unknown:
         raise SystemExit(f"unknown server(s): {', '.join(sorted(unknown))}")
     envs = {name: env for name in servers}
-    startup = {"engine": 120, "engine_graphs": 120, "huggingface": 120, "vllm": 600}  # vLLM compiles on start-up
+    startup = {"engine": 120, "engine_graphs": 120, "engine_full": 120, "huggingface": 120, "vllm": 600}  # vLLM compiles on start-up
     if "vllm" in selected:
         venv = Path(args.vllm_env)
         if not (venv / "bin" / "vllm").exists():
