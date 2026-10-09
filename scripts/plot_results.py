@@ -72,9 +72,10 @@ def style(ax, title: str, xlabel: str, ylabel: str) -> None:
     ax.spines[["top", "right"]].set_visible(False)
 
 
-def save(fig, out: Path) -> None:
+def save(fig, out: Path, relayout: bool = True) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
+    if relayout:  # pass False to keep margins a chart reserved itself (e.g. for a two-line footnote)
+        fig.tight_layout()
     fig.savefig(out, dpi=150)
     print(f"wrote {out}")
 
@@ -137,6 +138,8 @@ def cmd_compare(args) -> None:
 INK, INK_2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e5e1", "#fcfcfb"
 SLOT_1, SLOT_2 = "#2a78d6", "#eb6834"
 SLOT_3 = "#1baf7a"  # aqua, Hugging Face; under 3:1 on the surface, so its values are always labelled
+SLOT_5 = "#e87ba4"  # magenta, vLLM; under 3:1 on the surface, so its lines are always labelled
+SLOT_7 = "#4a3aa7"  # violet, the engine with CUDA graphs
 
 
 def readme_style() -> None:
@@ -186,6 +189,8 @@ def log_ms_axis(ax, values, pad_low: float, pad_high: float) -> None:
 
 
 def chart_ttft_vs_rate(results: Path, out: Path, context: str) -> None:
+    if not list(results.glob("continuous_rate*.csv")):
+        return
     fig, ax = plt.subplots(figsize=(8, 4.8))
     handles = []
     values = []
@@ -230,6 +235,8 @@ def chart_ttft_vs_rate(results: Path, out: Path, context: str) -> None:
 
 
 def chart_policy_at_rate(results: Path, rate: float, out: Path, context: str) -> None:
+    if not (results / f"continuous_rate{rate:g}.csv").exists() or not (results / f"static_rate{rate:g}.csv").exists():
+        return
     cont = summary(results / f"continuous_rate{rate:g}.csv")
     stat = summary(results / f"static_rate{rate:g}.csv")
     fig, (left, right) = plt.subplots(1, 2, figsize=(9, 4.2), gridspec_kw={"width_ratios": [2, 1]})
@@ -297,10 +304,10 @@ def chart_slots(results: Path, out: Path, context: str) -> None:
 
 def chart_decode_step(results: Path, out: Path, context: str) -> None:
     frames = []
-    for dtype in ("fp16", "fp32"):
-        path = results / f"bench_{dtype}.csv"
+    for run in ("fp16", "fp32", "fp16_graphs"):
+        path = results / f"bench_{run}.csv"
         if path.exists():
-            frames.append(pd.read_csv(path))
+            frames.append(pd.read_csv(path).assign(run=run))
     if not frames:
         return
     bench = pd.concat(frames)
@@ -309,9 +316,11 @@ def chart_decode_step(results: Path, out: Path, context: str) -> None:
     fig, axes = plt.subplots(1, len(lengths), figsize=(4 * len(lengths), 4.2), sharey=True)
     top = decode["ms"].max() * 1.1  # shared axis must fit every panel, not just the first
     for ax, length in zip(axes, lengths):
-        for dtype, color in (("fp16", SLOT_1), ("fp32", SLOT_2)):
-            d = decode[(decode["dtype"] == dtype) & (decode["length"] == length)].sort_values("batch")
-            ax.plot(d["batch"], d["ms"], color=color, marker="o", label=dtype)
+        for run, color, label in (("fp16_graphs", SLOT_7, "fp16 + CUDA graphs"), ("fp16", SLOT_1, "fp16"),
+                                  ("fp32", SLOT_2, "fp32")):
+            d = decode[(decode["run"] == run) & (decode["length"] == length)].sort_values("batch")
+            if not d.empty:
+                ax.plot(d["batch"], d["ms"], color=color, marker="o", label=label)
         ax.set_xscale("log", base=2)
         batches = sorted(decode["batch"].unique())
         ax.set_xticks(batches, [str(b) for b in batches])
@@ -321,8 +330,12 @@ def chart_decode_step(results: Path, out: Path, context: str) -> None:
         tidy(ax)
     axes[0].set_ylabel("ms per decode step")
     axes[0].legend(loc="upper left")
-    short = decode[(decode["dtype"] == "fp16") & (decode["length"] == lengths[0])].set_index("batch")["ms"]
-    if 1 in short.index and 16 in short.index:
+    short = decode[(decode["run"] == "fp16") & (decode["length"] == lengths[0])].set_index("batch")["ms"]
+    graphed = decode[(decode["run"] == "fp16_graphs") & (decode["length"] == lengths[0])].set_index("batch")["ms"]
+    if 1 in short.index and 1 in graphed.index:
+        title = (f"CUDA graphs cut a decode step from {short[1]:.1f} to {graphed[1]:.1f} ms for one request "
+                 f"(fp16, cache length {lengths[0]})")
+    elif 1 in short.index and 16 in short.index:
         title = (f"In fp16, a decode step costs {short[1]:.1f} ms for 1 request and {short[16]:.1f} ms for 16 "
                  f"(cache length {lengths[0]})")
     else:
@@ -391,6 +404,62 @@ def chart_baseline(results: Path, out: Path, context: str) -> None:
     save(fig, out)
 
 
+def baseline_points(results: Path, server: str) -> pd.DataFrame:
+    rows = []
+    for path in results.glob(f"baseline_{server}_rate*.csv"):
+        s = summary(path)
+        s["rate"] = float(re.search(r"_rate(\d+(?:\.\d+)?)$", path.stem).group(1))
+        rows.append(s)
+    return pd.DataFrame(rows).set_index("rate").sort_index() if rows else pd.DataFrame()
+
+
+def chart_engine_vs_vllm(results: Path, out: Path, context: str) -> None:
+    """The engine with and without CUDA graphs against vLLM (kaggle_baseline.py, one session)."""
+    # (key, label, colour, vertical offset of its value label: the two low lines sit close together)
+    servers = (("engine", "engine", SLOT_1, 0), ("engine_graphs", "engine + CUDA graphs", SLOT_7, -7),
+               ("vllm", "vLLM", SLOT_5, 7))
+    points = {key: baseline_points(results, key) for key, *_ in servers}
+    if any(points[key].empty for key, *_ in servers):
+        return
+    rates = sorted(set.intersection(*(set(points[key].index) for key, *_ in servers)))
+    fig, (left, right) = plt.subplots(1, 2, figsize=(11, 4.6))
+    ttft_values = []
+    for key, label, color, dy in servers:
+        d = points[key].loc[rates]
+        for ax, column in ((left, "tpot_p50"), (right, "ttft_p50")):
+            ax.plot(rates, d[column], color=color, marker="o", label=label)
+        ttft_values += list(d["ttft_p50"])
+        # Direct label at the lowest rate, where the lines are furthest apart.
+        left.annotate(f"{d['tpot_p50'].iloc[0]:.1f}", (rates[0], d["tpot_p50"].iloc[0]), xytext=(-10, dy),
+                      textcoords="offset points", ha="right", va="center", fontsize=9, color=INK)
+    for ax in (left, right):
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(rates, [f"{r:g}" for r in rates])
+        ax.set_xlabel("offered load (requests per second)")
+        tidy(ax)
+    left.set_xlim(rates[0] / 1.6, rates[-1] * 1.2)
+    left.set_ylim(0, max(points[key].loc[rates, "tpot_p50"].max() for key, *_ in servers) * 1.15)
+    left.set_ylabel("milliseconds")
+    left.set_title("Time per output token (p50)")
+    left.legend(loc="upper left")
+    log_ms_axis(right, ttft_values, 0.6, 2.5)
+    right.set_ylabel("milliseconds (log scale)")
+    right.set_title("Time to first token (p50)")
+
+    low = rates[0]
+    eager, graphs, vllm = (points[key].loc[low, "tpot_p50"] for key in ("engine", "engine_graphs", "vllm"))
+    fig.suptitle(f"CUDA graphs cut the engine's time per token {eager / graphs:.1f}x at {low:g} req/s: "
+                 f"{graphs:.1f} ms against vLLM's {vllm:.1f} ms", x=0.01, ha="left", fontsize=12, fontweight="bold")
+    top = rates[-1]
+    tps = {key: points[key].loc[top, "tokens_per_s"] for key, *_ in servers}
+    footnote(fig, context.replace(" · 32 slots", "") + " · at most 32 sequences in flight on both servers · "
+             "vLLM 0.31 (Triton attention: FlashAttention needs a newer GPU)\n"
+             f"Throughput at {top:g} req/s: {tps['engine_graphs']:.0f} (engine + graphs), {tps['vllm']:.0f} (vLLM), "
+             f"{tps['engine']:.0f} (engine) output tokens/s")
+    fig.tight_layout(rect=(0, 0.12, 1, 0.93))
+    save(fig, out, relayout=False)
+
+
 def cmd_readme(args) -> None:
     results = Path(args.files[0])
     out_dir = Path(args.out) if args.out else results
@@ -401,6 +470,7 @@ def cmd_readme(args) -> None:
     chart_slots(results, out_dir / "slots_vs_throughput.png", context)
     chart_decode_step(results, out_dir / "decode_step_vs_batch.png", context)
     chart_baseline(results, out_dir / "engine_vs_huggingface.png", context)
+    chart_engine_vs_vllm(results, out_dir / "engine_vs_vllm.png", context)
 
 
 def main() -> None:
