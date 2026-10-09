@@ -26,7 +26,7 @@ namespace gpt2 {
 class DecodeGraphs {
  public:
   // Throws std::runtime_error when the model is not on CUDA or LibTorch was built without CUDA.
-  DecodeGraphs(const GPT2Model& model, KVCache& cache, int64_t length_step = 128);
+  DecodeGraphs(const GPT2Model& model, KVCache& cache, int64_t length_step = 64);
   ~DecodeGraphs();
 
   DecodeGraphs(const DecodeGraphs&) = delete;
