@@ -5,6 +5,14 @@
 // Usage: gpt2_bench [--weights weights] [--device cpu|cuda] [--dtype fp32|fp16]
 //                   [--slots 32] [--iters 20] [--warmup 5] [--out results/bench.csv]
 //                   [--cuda-graphs]   decode steps replayed from CUDA graphs (model/decode_graphs.h)
+//                   [--graph-length-step 64]
+//
+// Phases in the CSV:
+//   prefill         one prompt of `length` tokens
+//   prefill_solo    `batch` prompts of `length` tokens, one pass each, the first token read back
+//                   after each (the scheduler with --solo-prefill)
+//   prefill_packed  the same prompts in one packed pass, first tokens read back once (the default)
+//   decode          one step for `batch` rows whose caches hold `length` tokens
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -47,7 +55,7 @@ double timed_ms(const torch::Device& device, int iters, int warmup, Fn&& fn) {
 }
 
 void print_row(const Row& row) {
-  std::cout << std::left << std::setw(8) << row.phase << " batch " << std::setw(4) << row.batch << " len "
+  std::cout << std::left << std::setw(15) << row.phase << " batch " << std::setw(4) << row.batch << " len "
             << std::setw(6) << row.length << std::right << std::fixed << std::setprecision(3) << std::setw(10)
             << row.ms << " ms " << std::setprecision(1) << std::setw(9) << row.tokens_per_s << " tok/s\n";
 }
@@ -59,6 +67,7 @@ int main(int argc, char** argv) {
   int64_t slots = 32;
   int iters = 20, warmup = 5;
   bool cuda_graphs = false;
+  int64_t graph_length_step = 64;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -75,6 +84,7 @@ int main(int argc, char** argv) {
       else if (arg == "--warmup") warmup = std::stoi(next());
       else if (arg == "--out") out_path = next();
       else if (arg == "--cuda-graphs") cuda_graphs = true;
+      else if (arg == "--graph-length-step") graph_length_step = std::stoll(next());
       else throw std::invalid_argument("unknown argument " + arg);
     } catch (const std::exception& e) {
       std::cerr << "error: " << e.what() << "\n";
@@ -105,11 +115,38 @@ int main(int argc, char** argv) {
     }
     std::cout << "\n";
 
+    // Several prompts admitted in the same step: one pass each, as before, against one packed pass.
+    constexpr int64_t kPromptLength = 128;
+    for (int64_t n : {1, 2, 4, 8, 16}) {
+      if (n > slots) continue;
+      std::vector<std::vector<int64_t>> prompts;
+      for (int64_t i = 0; i < n; ++i) {
+        const auto ids = torch::randint(0, model.config().vocab_size, {kPromptLength},
+                                        torch::TensorOptions().dtype(torch::kInt64));
+        prompts.emplace_back(ids.data_ptr<int64_t>(), ids.data_ptr<int64_t>() + kPromptLength);
+      }
+      const double solo_ms = timed_ms(device, iters, warmup, [&] {
+        for (int64_t i = 0; i < n; ++i) {
+          const auto ids = torch::tensor(prompts[static_cast<size_t>(i)], torch::kInt64).unsqueeze(0);
+          model.prefill(ids, i, cache)[0].argmax(-1).item<int64_t>();
+        }
+      });
+      const double packed_ms = timed_ms(device, iters, warmup, [&] {
+        model.prefill_packed(prompts, 0, cache).argmax(-1).to(torch::kCPU);
+      });
+      const double tokens = static_cast<double>(n * kPromptLength);
+      rows.push_back({"prefill_solo", n, kPromptLength, solo_ms, tokens / solo_ms * 1000.0});
+      print_row(rows.back());
+      rows.push_back({"prefill_packed", n, kPromptLength, packed_ms, tokens / packed_ms * 1000.0});
+      print_row(rows.back());
+    }
+    std::cout << "\n";
+
     // Decode: one step for `batch` rows whose caches already hold `length` tokens.
     std::unique_ptr<gpt2::DecodeGraphs> graphs;
     if (cuda_graphs) {
       const auto start = Clock::now();
-      graphs = std::make_unique<gpt2::DecodeGraphs>(model, cache);
+      graphs = std::make_unique<gpt2::DecodeGraphs>(model, cache, graph_length_step);
       const auto captured = graphs->capture_all();
       std::cout << "captured " << captured << " decode graphs in "
                 << std::chrono::duration<double>(Clock::now() - start).count() << " s\n\n";
