@@ -243,9 +243,11 @@ capacity ~50 req/s (~3200 tok/s), continuous batching -95% first-token latency v
 - [x] Re-run the full sweep: served throughput 730 -> 3239 tok/s; overload now answers 429, no dropped connections
 - [x] Commit CSVs + PNGs to `results/2026-10-05_t4/`, with an engine-vs-Hugging-Face chart; chart titles computed from the data
 - [ ] Load generator: varied output lengths, so static batching's idle-slot cost is visible
-- [ ] Time prefill and decode inside the scheduler (expose in `/stats`): ~10 ms per served step vs 5.3-6.1 ms isolated
+- [x] Time prefill and decode inside the scheduler (`/stats`): bookkeeping is negligible; prefill is ~34% of a
+      saturated run once decode uses CUDA graphs
 - [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
-- [ ] vLLM baseline (separate job/venv; verify T4 support first)
+- [x] vLLM baseline (0.31, own venv, T4 via Triton attention): the engine with CUDA graphs matches it on this
+      workload (TPOT 2-10% lower, first token 2.7-3.5x sooner, +5% throughput past capacity)
 - [ ] GPT-2 medium run (bonus, config-driven)
 
 **Done when:** 4–5 clean, labelled charts.
@@ -254,7 +256,13 @@ capacity ~50 req/s (~3200 tok/s), continuous batching -95% first-token latency v
 
 ## Phase 8 — Stretch (optional)
 
-- [ ] CUDA graphs: bucket `B` and `T_eff`, capture decode per bucket, measure overhead cut
+- [x] CUDA graphs: bucket `B` and `T_eff`, capture decode per bucket, measure overhead cut
+      (decode step 4.8 -> 2.2 ms at batch 1; served TPOT 6.0 -> 2.5 ms; capacity +12%)
+- [ ] Finer length buckets (64): batch 32 with a 512-token cache is slower with graphs (7.3 vs 6.3 ms),
+      513 is padded to 640
+- [ ] Batch the prefills admitted in one step: prefill is now the largest remaining cost
+- [ ] Make CUDA graphs the default for `gpt2_serve` on CUDA once a second session confirms the gain
+- [x] Streaming decode re-decoded the whole output per token (O(n^2), under a shared lock): now O(1) per token
 - [ ] Custom CUDA decode-attention kernel (needs nvcc on Kaggle), compare vs LibTorch
 - [ ] Paged KV cache (block table + allocator), best combined with the custom kernel
 - [ ] Chunked prefill

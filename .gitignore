@@ -11,3 +11,6 @@ compile_commands.json
 .cache/
 .vscode/
 .idea/
+
+# Server logs from the Kaggle scripts: diagnostics, not results
+results/**/logs/

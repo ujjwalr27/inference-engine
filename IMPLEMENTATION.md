@@ -164,7 +164,7 @@ Everything runs under `torch::InferenceMode guard;`.
 - **Compaction:** active requests always occupy slots `0..B-1`. When the request in slot `i` finishes, copy the last active slot `B-1` into `i` (only `[0, len)`), update that request's slot index, `B -= 1`. Decode then uses `K[l].narrow(0, 0, B)` — a view, no copy.
 - **Write:** `K[l].index_put_({arange(B), :, pos}, k_new)` via advanced indexing (one scatter per layer).
 - **Read length:** slice time dim to `T_eff = max(pos) + 1`; mask `key_j` for row `i` iff `j > pos[i]`.
-- Later (CUDA graphs): replace dynamic `B`/`T_eff` with buckets (e.g. B ∈ {1,2,4,8,16,32}, T ∈ {128,256,512,1024}).
+- **CUDA graphs** (`model/decode_graphs`, `--cuda-graphs`): a graph per bucket, batch ∈ {1, 2, 4, …, n_slots} and `T_eff` rounded up to a multiple of 128 (8 lengths, so 48 graphs for 32 slots, captured in 0.7 s on the T4 when the scheduler starts). Padding is safe by construction: extra keys lie past every row's position, so the decode mask (now built even for one row) hides them; padding rows feed token 0 at position 0 into slots `B..bucket-1`, which no active request occupies and which a prefill overwrites before anything reads them. All graphs share one memory pool; they never run concurrently and each output is read before the next replay.
 
 ---
 
@@ -212,7 +212,8 @@ Continuous batching (§6.2) avoids all of this: each request is prefilled on its
 - `tokenizers::Tokenizer::FromBlobJSON(read("weights/tokenizer.json"))`, `Encode`, `Decode`.
 - **One instance, loaded at server start and shared by every HTTP worker**, with calls serialised by a mutex inside the wrapper: tokenizers-cpp's `Decode` writes its result into a buffer held by the handle and reads it back, so concurrent calls on one handle could swap results. The lock is held for microseconds.
 - It was originally one instance per worker thread (`thread_local`). Loading `tokenizer.json` takes ~200 ms, and with ~300 workers most low-load requests landed on a thread paying that load — the Hugging Face baseline exposed it (see the Phase 7 results).
-- **IncrementalDecoder** for streaming: keep all generated IDs, decode the full list each step, emit only the new suffix; hold back if the text ends in `U+FFFD` (incomplete UTF-8 sequence).
+- **IncrementalDecoder** for streaming: decode only the tokens since the last emitted character and emit that text; hold back while it ends in `U+FFFD` (incomplete UTF-8 sequence). Byte-level BPE decodes each token to its own bytes, so decoding can restart at any character boundary and the pieces always concatenate to the full decode (checked on 3,000 random streams, half built from tokens that are partial characters on their own). It used to re-decode the whole output every token, under the lock every stream shares: 500,500 token decodes (75 ms) for a 1,000-token answer, now 1,499 (1 ms).
+- `vocab_size()` is read once at load: the bundled tokenizers 0.21 answers it by building the whole 50k-entry vocabulary map, ~8 ms a call (a test that called it per token took 417 s).
 
 ---
 
@@ -273,7 +274,7 @@ Reference runs use HF with `attn_implementation="eager"`, `float32`, and the sam
 - **4.7× the throughput at 8 req/s**, where the engine is nowhere near its limit (capacity ~50 req/s, below). Serial `generate()` tops out at ~1.9 req/s (~118 tok/s): 64 tokens × 8.3 ms ≈ 0.53 s per request.
 - **Each token is 1.4–1.7× cheaper**, even with little batching: `generate()` pays Python-level overhead every step (logits processors, stopping criteria, the streamer); the engine's decode loop is C++.
 - **First token in 7–9 ms at every load**, against 16 ms for Hugging Face when idle and tens of seconds once its queue builds. A whole 64-token request takes 380 ms at 8 req/s, against 37.6 s.
-- This is the naive baseline. Hugging Face TGI and vLLM batch continuously too; they have not been measured here.
+- This is the naive baseline. Hugging Face TGI and vLLM batch continuously too; vLLM is measured in the Phase 8 results below.
 - Kaggle sessions vary: the 2026-10-01 session measured Hugging Face at 11.3 ms/token and 87 tok/s (6.3× at 8 req/s) and the engine at 6.7–7.3 ms/token. Compare within a session only.
 
 **Continuous vs static batching** (32 slots; static gathers up to 32 requests for at most 50 ms, then runs that batch to completion).
@@ -311,6 +312,53 @@ Reference runs use HF with `attn_implementation="eager"`, `float32`, and the sam
 Two tooling bugs found along the way, both fixed:
 - The "port may be shared" warning fired on 8 runs, but each gap was exactly the number of connection failures, i.e. requests the server never saw. The check now counts only requests that got an HTTP answer.
 - `plot_results.py` computed wall time as `max(send) + max(done)`, pairing the latest send with the slowest request, so its tokens/s ran ~30% low. It now uses `max(send + done)` and reproduces the load generator's figure exactly.
+
+**Phase 8 results: CUDA graphs, and the engine against vLLM (Kaggle T4, fp16, 2026-10-08).** One session and one build (`perf/scheduler-timing` at `18338e4`); 82/82 tests pass, including the two CUDA graph tests. Same workload as Phase 7: prompts of 32–256 tokens, 64 output tokens, open-loop Poisson arrivals for 20 s, a fresh server per configuration. Data and charts in `results/2026-10-08_t4_graphs/`; regenerate the charts with `python scripts/plot_results.py readme results/2026-10-08_t4_graphs`.
+
+**A decode step, isolated** (`gpt2_bench`, fp16, ms per step):
+
+| Cache length | Batch | Eager | CUDA graphs | Speed-up |
+|---|---|---|---|---|
+| 128 | 1 | 4.83 | **2.24** | 2.2× |
+| 128 | 8 | 5.53 | **2.76** | 2.0× |
+| 128 | 32 | 5.84 | **4.62** | 1.3× |
+| 512 | 8 | 5.39 | **3.45** | 1.6× |
+| 512 | 32 | **6.26** | 7.33 | 0.85× |
+| 1023 | 32 | 10.13 | 10.12 | 1.0× |
+
+- **The step was launch-bound, as predicted.** Replaying it as one graph halves it at small batches (4.8 → 2.2 ms for one request). The gain shrinks as batch × length grows, because then the GPU work itself dominates.
+- **One corner is slower: batch 32 with a 512-token cache.** The length bucket rounds 513 up to 640, which adds 25% of attention work, and at that size the attention outweighs the launches saved. The served workload never gets there (its contexts stay under 320 tokens). A step of 64 would halve the worst-case padding; untested.
+
+**Served, three servers in one session** (all fp16, at most 32 sequences in flight each):
+
+| Rate | TPOT p50: engine / + graphs / vLLM | TTFT p50: engine / + graphs / vLLM | Whole request p50: engine / + graphs / vLLM |
+|---|---|---|---|
+| 4 | 6.0 / **2.5** / 2.8 ms | 9 / **7** / 21 ms | 384 / **164** / 195 ms |
+| 8 | 6.4 / **2.7** / 3.0 ms | 10 / **8** / 21 ms | 410 / **177** / 208 ms |
+| 16 | 7.0 / **3.4** / 3.7 ms | 10 / **8** / 24 ms | 452 / **219** / 258 ms |
+| 32 | 8.2 / **5.5** / 5.6 ms | 11 / **9** / 32 ms | 528 / **356** / 381 ms |
+| 64 | 10.1 / **9.0** / 9.2 ms | 3.8 / **2.6** / 3.2 s | 4.5 / **3.1** / 3.8 s |
+
+At 64 req/s (past capacity): engine + graphs **3,486** output tok/s with all 1,345 requests served; vLLM 3,325; the eager engine 3,121 with 102 turned away with 429.
+
+- **CUDA graphs cut time per token 2.4× at low load** (6.0 → 2.5 ms) and whole requests 2.3× (384 → 164 ms). Capacity rises ~12% (48.9 → 54.7 completed req/s).
+- **Against vLLM, the engine with graphs is on par or slightly ahead on this workload:** time per token 2–10% lower at 4–32 req/s, whole requests 7–16% faster, first token 2.7–3.5× sooner (7–9 against 21–32 ms), and 5% more throughput past capacity. vLLM's extra first-token time is its Python API layer and request handling.
+- **Read that narrowly.** GPT-2 small on a T4, where vLLM cannot use FlashAttention (it needs compute capability 8.0; vLLM ran Triton attention with `torch.compile` and its own CUDA graphs). Both servers were capped at 32 sequences in flight, below vLLM's default. Every request generated exactly 64 tokens, and this is one session. The fair claim is that the engine matches vLLM here, not that it beats vLLM in general.
+
+**Where the scheduler's time goes** (the new `/stats` split, one 20 s run each):
+
+| Rate | Decode ms/step: eager / graphs | Prefill: eager / graphs | Bookkeeping |
+|---|---|---|---|
+| 4 | 5.59 / 2.39 | 0.9 / 0.6 s | 0.1 s |
+| 16 | 6.18 / 2.74 | 2.6 / 2.3 s | 0.3 s |
+| 64 | 6.80 / 5.69 | 8.2 / 8.4 s | 0.7–0.8 s |
+
+- Bookkeeping (admitting, publishing, finishing, compacting) is negligible: at most 0.8 s in a 25 s run.
+- **Prefill is now the largest remaining cost.** It is ~34% of a saturated run with graphs. Each admitted request is prefilled on its own, ending in a device sync. The next step is to batch the prefills admitted in one step, or chunk them.
+
+**Correctness.** Graph-replayed logits match the eager step on the same cache in fp32 and fp16 (same top token), with a padded batch (3 rows run as 4) and a padded length. Through the scheduler, all 8 requests (4 prompts × fp32 and fp16, 24 tokens each) produced exactly their solo-run output; none needed the near-tie allowance.
+
+**The harness bug behind the first vLLM run (2026-10-07).** vLLM froze 19 s into the 32 req/s run and 7 s into the 64 req/s run; every later request hung until the client's 300 s timeout (28 and 865 failures). The scripts sent server output to a pipe that nothing read. Now that logs go to files, their sizes confirm it: vLLM wrote 25, 31 and 43 KB at 4, 8 and 16 req/s, and 66 and 109 KB at 32 and 64. It froze in exactly the two runs that outgrew the ~64 KB pipe. vLLM's log has one `ERROR` line per start (FlashAttention 2 needs compute capability 8.0); it falls back to Triton attention and is otherwise healthy.
 
 **Phase 6 result (Kaggle T4, 2026-09-19): 75/75 tests pass**, including six GPU tests. The first run failed two of them; both were tolerances guessed on CPU, not engine faults (see below).
 
@@ -401,7 +449,7 @@ Checked against the current dev machine (Windows 11, Ryzen 7 250, 13.7 GB RAM, R
 | 5 | Server + loadgen | 1–1.5 wk | Local CPU run produces a sensible CSV |
 | 6 | Kaggle GPU + FP16 | 1 wk | Kaggle job builds, passes GPU tests, saves CSV |
 | 7 | Benchmarks | 1 wk | 4–5 labelled charts |
-| 8 | Stretch (CUDA graphs, custom kernel, paged cache) | open | per item |
+| 8 | Stretch (CUDA graphs, custom kernel, paged cache) | CUDA graphs done | per item |
 | 9 | Polish | 3–4 d | README, charts, demo video, Dockerfile |
 
 Realistic total without stretch goals: **~12–14 weeks part-time.**
