@@ -47,9 +47,9 @@ Design rules:
 |---|---|
 | Local dev | **WSL2 Ubuntu 26.04** (not native Windows — see §10), gcc/clang, CMake ≥ 3.24, Ninja, LibTorch CPU (Linux, cxx11 ABI), Rust (`rustup`, for tokenizers-cpp), Python 3.12 venv. One-shot: `scripts/setup_wsl.sh` |
 | Python venv | `torch` (CPU), `transformers`, `safetensors`, `pandas`, `matplotlib` |
-| CI | GitHub Actions `ubuntu-latest`, CPU LibTorch (cached), build + ctest, TSan job on scheduler tests |
+| CI | GitHub Actions `ubuntu-latest`, CPU LibTorch (cached). A `weights` job exports GPT-2 and the reference data (cached until either script changes); the full suite then runs with them, again under ASan + UBSan, and the threading tests under TSan |
 | GPU | Kaggle notebook, **T4** accelerator, LibTorch from Kaggle's pip `torch` (`torch.utils.cmake_prefix_path`) |
-| Container | Dockerfile (CPU only), multi-stage: builder with Rust + LibTorch, slim runtime |
+| Container | `Dockerfile` (CPU only), four stages: `toolchain` (compilers, cargo, LibTorch), `build` (compiles, runs ctest), `weights` (exports GPT-2), `runtime` (binaries + LibTorch's shared libraries + weights, serves on 8080). The toolchain stage is also the local build environment since the WSL distribution was removed: the checkout is mounted and the build directory lives in a Docker volume |
 
 **Version pinning (confirmed 2026-09-17):**
 | | Local (WSL2) | Kaggle |
@@ -73,6 +73,8 @@ Design rules:
 
 **Repo location:** source stays on the Windows side (`C:\Users\Ujjwal\Desktop\Projects\inference_engine`, i.e. `/mnt/c/...` in WSL); the **build directory lives on the Linux filesystem** (`~/build/gpt2-engine-*`) so compile I/O stays fast. `.gitattributes` forces LF line endings.
 
+**Build trim (2026-10-09).** The submodule's own CMakeLists compiles SentencePiece, with its bundled protobuf-lite and Abseil, even when the SentencePiece tokenizer is switched off, because `tokenizers_cpp` links `sentencepiece-static` unconditionally. GPT-2's byte-level BPE uses none of it. `CMakeLists.txt` now builds the two pieces the engine needs itself: the Rust crate (cargo, as a custom command) and the one C++ file that wraps it. A full build went from 313 Ninja steps to 52, measured on the same checkout (`ninja -n`). The nested submodules (`sentencepiece`, `msgpack`) no longer need cloning either.
+
 **WSL memory:** WSL sees ~6 GB by default, and a torch + GoogleTest translation unit needs ~2 GB to compile, so `scripts/build.sh` defaults to `JOBS=2`. Building with 6 jobs made WSL thrash badly enough to stop responding. Raise `JOBS` only after giving WSL more memory in `%UserProfile%\.wslconfig` (`[wsl2]` → `memory=10GB`).
 
 **Third-party (C++):**
@@ -82,7 +84,7 @@ Design rules:
 | GoogleTest | tests | `FetchContent` |
 | nlohmann/json | safetensors header, HTTP JSON | `FetchContent` |
 | cpp-httplib | HTTP server + loadgen client | `FetchContent` (header-only) |
-| mlc-ai/tokenizers-cpp | HF tokenizer (`tokenizer.json`) | git submodule, needs `cargo`; `MLC_ENABLE_SENTENCEPIECE_TOKENIZER=OFF` |
+| mlc-ai/tokenizers-cpp | HF tokenizer (`tokenizer.json`) | git submodule (top level only), needs `cargo`; only its Rust crate and `huggingface_tokenizer.cc` are built |
 
 ---
 
@@ -152,6 +154,12 @@ Tensor forward(const Tensor& ids /*[B,T]*/, const Tensor& pos /*[B,T]*/, const T
 // Cached paths (Phase 2+)
 Tensor prefill(const Tensor& ids /*[1,T]*/, int slot, KVCache&);              // returns last-token logits [1,V]
 Tensor decode(const Tensor& ids /*[B]*/, const Tensor& pos /*[B]*/, int batch, KVCache&); // logits [B,V]; rows 0..B-1 = slots 0..B-1
+
+// Batched prefill (Phase 8): prompt i fills slot first_slot + i from position 0; logits [n,V].
+// Right-padded into [n, longest] with a causal mask (the scheduler's layout):
+Tensor prefill_padded(const std::vector<std::vector<int64_t>>& prompts, int first_slot, KVCache&);
+// Packed end to end into [1, sum T] with a block-diagonal causal mask (benchmarked, not used):
+Tensor prefill_packed(const std::vector<std::vector<int64_t>>& prompts, int first_slot, KVCache&);
 ```
 Everything runs under `torch::InferenceMode guard;`.
 
@@ -164,7 +172,8 @@ Everything runs under `torch::InferenceMode guard;`.
 - **Compaction:** active requests always occupy slots `0..B-1`. When the request in slot `i` finishes, copy the last active slot `B-1` into `i` (only `[0, len)`), update that request's slot index, `B -= 1`. Decode then uses `K[l].narrow(0, 0, B)` — a view, no copy.
 - **Write:** `K[l].index_put_({arange(B), :, pos}, k_new)` via advanced indexing (one scatter per layer).
 - **Read length:** slice time dim to `T_eff = max(pos) + 1`; mask `key_j` for row `i` iff `j > pos[i]`.
-- **CUDA graphs** (`model/decode_graphs`, `--cuda-graphs`): a graph per bucket, batch ∈ {1, 2, 4, …, n_slots} and `T_eff` rounded up to a multiple of 128 (8 lengths, so 48 graphs for 32 slots, captured in 0.7 s on the T4 when the scheduler starts). Padding is safe by construction: extra keys lie past every row's position, so the decode mask (now built even for one row) hides them; padding rows feed token 0 at position 0 into slots `B..bucket-1`, which no active request occupies and which a prefill overwrites before anything reads them. All graphs share one memory pool; they never run concurrently and each output is read before the next replay.
+- **Batched prefill writes:** a right-padded batch is one strided copy per layer into slots `[first, first + n)`, columns `[0, longest)`. Padding columns past a prompt's end hold garbage that is never read: decode writes position `p` before any row attends to it, and compaction copies only `[0, position)`. The packed layout writes with one `index_put_` per layer at per-token `(slot, position)` pairs.
+- **CUDA graphs** (`model/decode_graphs`, on by default for `gpt2_serve` on CUDA): a graph per bucket, batch ∈ {1, 2, 4, …, n_slots} and `T_eff` rounded up to a multiple of `--graph-length-step`. That was 128 when first measured (8 lengths, 48 graphs for 32 slots, captured in 0.7 s on the T4 when the scheduler starts); it is 64 now (16 lengths, 96 graphs), which halves the worst-case padding at the cost of twice the capture time and graph outputs. Padding is safe by construction: extra keys lie past every row's position, so the decode mask (now built even for one row) hides them; padding rows feed token 0 at position 0 into slots `B..bucket-1`, which no active request occupies and which a prefill overwrites before anything reads them. All graphs share one memory pool; they never run concurrently and each output is read before the next replay.
 
 ---
 
@@ -182,7 +191,9 @@ See `scheduler/request.h`. Fields fall into three groups, which is what keeps th
 
 ### 6.2 Step loop (continuous policy)
 Implemented in `scheduler/scheduler.cpp`:
-1. **Admit:** while free slots remain and the prefill budget (`prefill_budget_tokens`, default 512) is not spent → `prefill` into the next free slot, publish the first token. A request whose prompt alone exceeds the budget is still admitted, so nothing can starve.
+1. **Admit:** while free slots remain and the prefill budget (`prefill_budget_tokens`, default 512) is not spent, take requests from the queue. A request whose prompt alone exceeds the budget is still admitted, so nothing can starve. Then **prefill them together**: one right-padded batch (`prefill_padded`) fills the next free slots and returns every first token in one device → host copy. A single request takes the plain `prefill` path, so a request alone runs exactly as it always did. `--solo-prefill` restores one pass per request.
+
+   A pass holds at most `prefill_budget_tokens` padded tokens (requests × longest prompt); the next request starts a new pass if it would push the pass past that. Prompts of similar length share one pass per step; one long prompt gets its own pass rather than padding a crowd of short ones to its length. The same cap splits a static batch, which is admitted without the budget, into bounded passes.
 2. If nothing is active → wait on the queue condition variable (no busy spin), then loop.
 3. **Decode:** build `ids[B]`, `positions[B]`, `length = max(position) + 1` → one `decode` → argmax on the device → **one** `.to(cpu)` for the whole step.
 4. **Publish:** push each token to its request's channel.
@@ -199,7 +210,7 @@ On `stop()`: close the queue, fail whatever is still in flight, drain the waitin
 - `positions` (for the position embedding) comes from `cumsum(mask) - 1`; `cache_index` is the shared column `T + step`.
 - the decode mask is an explicit `key_mask [B, length]` (padding columns excluded), not `arange <= position`.
 
-Continuous batching (§6.2) avoids all of this: each request is prefilled on its own, left-aligned in its slot, so cache column == position id and the mask comes straight from the positions.
+Continuous batching (§6.2) avoids all of this: each request sits left-aligned in its own slot, so cache column == position id and the mask comes straight from the positions. Its batched prefill pads on the right, so every prompt still starts at column 0 = position 0 and the cache ends up exactly as a solo prefill leaves it.
 
 ### 6.4 Admission control
 - Bounded queue `--max-queue`. Full → HTTP 429.
@@ -236,7 +247,7 @@ Errors: `400` invalid/too long, `429` queue full, `503` shutting down.
 
 ### 8.2 Load generator (`tools/loadgen.cpp`)
 - **Open loop:** Poisson arrivals at `--rate` req/s for `--duration`; each request fires on schedule regardless of earlier responses (one thread per in-flight request, or a thread pool larger than the peak concurrency).
-- Prompt length / output length from a configurable distribution (uniform, or sampled from a file of prompts).
+- Prompt length uniform in `[--prompt-min, --prompt-max]`. Output length is `--max-tokens` for every request (EOS ignored, so every server does the same work), or uniform in `[--max-tokens-min, --max-tokens]`. Only with mixed lengths does static batching pay for its idle slots: a batch runs until its longest request finishes.
 - Records per request: `id, prompt_tokens, output_tokens, t_send, t_first_token, t_done, status`.
 - Also accepts `token_ids` mode so tokenizer cost can be excluded.
 
@@ -360,6 +371,31 @@ At 64 req/s (past capacity): engine + graphs **3,486** output tok/s with all 1,3
 
 **The harness bug behind the first vLLM run (2026-10-07).** vLLM froze 19 s into the 32 req/s run and 7 s into the 64 req/s run; every later request hung until the client's 300 s timeout (28 and 865 failures). The scripts sent server output to a pipe that nothing read. Now that logs go to files, their sizes confirm it: vLLM wrote 25, 31 and 43 KB at 4, 8 and 16 req/s, and 66 and 109 KB at 32 and 64. It froze in exactly the two runs that outgrew the ~64 KB pipe. vLLM's log has one `ERROR` line per start (FlashAttention 2 needs compute capability 8.0); it falls back to Triton attention and is otherwise healthy.
 
+**Phase 8 follow-ups (2026-10-09): batched prefill, 64-token graph buckets, graphs by default. Verified on CPU; not yet measured on a GPU.** The 2026-10-08 timing split named prefill as the largest remaining cost, so:
+- **Batched prefill.** The requests admitted in one step are prefilled together (§6.2) and all their first tokens come back in one device → host copy. Before, each admitted request was its own pass of ~200 kernel launches, ending in its own sync.
+
+  **Packed first, then padded, decided by measurement.** The first version packed the prompts end to end in one row with a block-diagonal causal mask, so no work went to padding. But attention then runs over the whole row: n prompts of length T cost (nT)² scores instead of n·T², most of them masked out. On CPU (`gpt2_bench`, 128-token prompts, the Docker image, 3 iterations), that made packing slower than one pass per prompt. Right padding into [n, longest] costs n·longest² and matched or beat it:
+
+  | Prompts | One pass each | Packed | Padded |
+  |---|---|---|---|
+  | 4 | 1108 ms | 1529 ms | **1083 ms** |
+  | 8 | 2932 ms | 4111 ms | **2703 ms** |
+  | 16 | 5034 ms | 11367 ms | **4809 ms** |
+
+  The CPU is compute-bound, so batching saves it nothing but costs packing its extra attention; the T4 is launch-bound at these sizes, where both layouts should beat one pass each. The scheduler uses padding, which cannot blow up quadratically, and caps a pass at the budget in padded tokens. `prefill_packed` stays in the model and in `gpt2_bench` so the GPU run measures all three.
+- **64-token length buckets** for the CUDA graphs, against the one corner that got slower with them (batch 32, 512-token cache, 513 padded to 640; it becomes 576).
+- **CUDA graphs on by default** in `gpt2_serve` on CUDA, on the strength of the 2026-10-08 session. The next Kaggle run re-measures eager against graphs in a second session; the default goes back if the gain does not hold.
+
+On CPU, in the Docker toolchain image with the real weights, all 88 tests pass (the 9 GPU tests skip), with the stress test at its full 100 requests. The new ones:
+- both batched layouts give the same logits and the same cached keys/values as per-prompt prefill (rtol and atol 1e-4), with prompts of 1, 10, 26 and 31 tokens;
+- four queued requests take one prefill pass, or four with `--solo-prefill`, with the same answers;
+- a long prompt among short ones gets a pass of its own;
+- a static batch is split into budget-sized passes.
+
+The whole suite also runs clean under AddressSanitizer and UBSan, the stress test included (79 pass, 9 GPU tests skip). The one finding was in a test helper: `memcpy` from an empty vector's `data()`, which may be null.
+
+What the next Kaggle run measures, all in one session: `bench_fp16_graphs.csv` against `bench_fp16_graphs128.csv` for the buckets, and the `prefill_solo`/`prefill_padded`/`prefill_packed` rows for batching alone. Served, `kaggle_baseline.py --servers engine,engine_graphs,engine_full,vllm` puts eager, graphs as of 2026-10-08, and the new defaults next to vLLM. The sweep's new section 5 runs static against continuous batching with 8–128 output tokens, which the fixed-length workload could not show.
+
 **Phase 6 result (Kaggle T4, 2026-09-19): 75/75 tests pass**, including six GPU tests. The first run failed two of them; both were tolerances guessed on CPU, not engine faults (see below).
 
 **The fp16 divergence question, settled with numbers.** Where batched fp16 output differs from a solo run, the gap between the top two logits at that step was **0** for one request (an exact tie in fp16 — the choice was arbitrary) and **0.0625** for the other, which is exactly one fp16 step at that magnitude. Neither is a scheduling bug; fp32 on the same path matches solo output exactly.
@@ -449,7 +485,7 @@ Checked against the current dev machine (Windows 11, Ryzen 7 250, 13.7 GB RAM, R
 | 5 | Server + loadgen | 1–1.5 wk | Local CPU run produces a sensible CSV |
 | 6 | Kaggle GPU + FP16 | 1 wk | Kaggle job builds, passes GPU tests, saves CSV |
 | 7 | Benchmarks | 1 wk | 4–5 labelled charts |
-| 8 | Stretch (CUDA graphs, custom kernel, paged cache) | CUDA graphs done | per item |
-| 9 | Polish | 3–4 d | README, charts, demo video, Dockerfile |
+| 8 | Stretch (CUDA graphs, custom kernel, paged cache) | CUDA graphs, batched prefill done | per item |
+| 9 | Polish | done except the demo video | README, charts, demo video, Dockerfile |
 
 Realistic total without stretch goals: **~12–14 weeks part-time.**

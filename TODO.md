@@ -26,13 +26,13 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 - [x] Repo pushed to https://github.com/ujjwalr27/inference-engine (29 commits, submodule included)
 - [x] First green run: `build-test-cpu` + `tsan-scheduler` both pass
       (needed one fix: cpp-httplib's optional OpenSSL/zlib/brotli/zstd backends turned off — see IMPLEMENTATION.md §2)
-- [ ] CI currently skips every model test (no weights). Add a job that caches the HF download and runs both scripts
+- [x] CI runs the model tests: a `weights` job exports GPT-2 + reference data once (cached on the two scripts' hash)
 
 ### Kaggle spike (main risk)
 - [x] Kaggle T4 notebook: torch 2.10.0+cu128, CUDA 12.8, Tesla T4
 - [x] Run `scripts/kaggle_spike.py`: ABI=cxx11, nvcc 12.8 present, 4 vCPU, 2× T4, no cargo; CUDA C++ fp16 matmul + SDPA pass
 - [x] Paste spike output into IMPLEMENTATION.md §2
-- [ ] Rust missing on Kaggle → in Phase 2, try `rustup` in the job; fall back to prebuilt tokenizers libs as a dataset
+- [x] Rust missing on Kaggle → `kaggle_run.py` installs it with `rustup` before configuring
 
 **Done when:** hello-tensor runs in WSL2, CI is green, and a CUDA tensor is printed from C++ on a Kaggle T4.
 
@@ -68,7 +68,7 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 - [x] Per-layer hidden states vs HF (all 13 within tolerance)
 - [x] Logits `allclose(rtol=1e-4, atol=1e-4)` + argmax for all 7 prompts. Max |diff|: 0 for T ≥ 26, 6.1e-5 (T=10), 2.6e-4 (T=1, passes on rtol; logits are ~−100)
 - [x] Batch of 3 identical rows == single row
-- [ ] CI: reference tests currently **skip** on GitHub (no weights). Add a job that caches the HF download and runs both scripts
+- [x] CI: reference tests run on GitHub against weights exported in CI
 
 **Done when:** C++ logits match HF for ≥ 5 prompts.
 
@@ -157,7 +157,7 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 - [x] Threading tests under **TSan**: 0 warnings (`.tsan-suppressions` + CI job `tsan-scheduler`)
 - [x] Real scheduler thread + model under TSan (single request, cancellation): 0 warnings, run locally
       (not in CI: needs the weights, and TSan + LibTorch is memory hungry)
-- [ ] ASan build of the full test suite, clean
+- [x] ASan + UBSan build of the full test suite, model tests included: clean (79 pass, 9 GPU tests skip; one UBSan finding fixed, a memcpy from an empty vector in a test helper). CI job `asan`
 
 **Done when:** 100 staggered random requests match their solo outputs and TSan is clean. ✅
 
@@ -216,7 +216,8 @@ Design and rationale: [IMPLEMENTATION.md](IMPLEMENTATION.md). Tick items as they
 - [x] Re-run on Kaggle: **75/75 pass**; fp16 divergences confirmed as top-2 gaps of 0 and 0.0625
 - [x] Fixed a benchmark hazard: a leftover server shared the port via `SO_REUSEPORT` and silently split the load
 - [ ] Profile one decode step (kernel launch count, CPU vs GPU time) — the batch-1 fp16 result says it is launch-bound
-- [ ] Trim the build: SentencePiece and Abseil are compiled but unused (~10 min of the Kaggle build)
+- [x] Trim the build: SentencePiece, protobuf-lite and Abseil are no longer compiled (only the tokenizers crate
+      and its C++ wrapper)
 
 **Done when:** the Kaggle job builds, passes GPU tests, and saves a benchmark CSV.
 
@@ -242,7 +243,8 @@ capacity ~50 req/s (~3200 tok/s), continuous batching -95% first-token latency v
 - [x] Correction: the earlier 2.3-2.6x per-token claim was an artifact of that bug (TPOT below one decode step)
 - [x] Re-run the full sweep: served throughput 730 -> 3239 tok/s; overload now answers 429, no dropped connections
 - [x] Commit CSVs + PNGs to `results/2026-10-05_t4/`, with an engine-vs-Hugging-Face chart; chart titles computed from the data
-- [ ] Load generator: varied output lengths, so static batching's idle-slot cost is visible
+- [x] Load generator: `--max-tokens-min` for mixed output lengths; `kaggle_sweep.py` section 5 compares the
+      policies with 8-128 output tokens (to run on Kaggle)
 - [x] Time prefill and decode inside the scheduler (`/stats`): bookkeeping is negligible; prefill is ~34% of a
       saturated run once decode uses CUDA graphs
 - [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
@@ -258,10 +260,14 @@ capacity ~50 req/s (~3200 tok/s), continuous batching -95% first-token latency v
 
 - [x] CUDA graphs: bucket `B` and `T_eff`, capture decode per bucket, measure overhead cut
       (decode step 4.8 -> 2.2 ms at batch 1; served TPOT 6.0 -> 2.5 ms; capacity +12%)
-- [ ] Finer length buckets (64): batch 32 with a 512-token cache is slower with graphs (7.3 vs 6.3 ms),
-      513 is padded to 640
-- [ ] Batch the prefills admitted in one step: prefill is now the largest remaining cost
-- [ ] Make CUDA graphs the default for `gpt2_serve` on CUDA once a second session confirms the gain
+- [x] Finer length buckets: 64 by default (`--graph-length-step`), for batch 32 with a 512-token cache, which was
+      slower with graphs (7.3 vs 6.3 ms) because 513 padded to 640. To measure on Kaggle (`bench_fp16_graphs*.csv`)
+- [x] Batch the prefills admitted in one step: one right-padded batch, one read-back (`--solo-prefill` turns it
+      off). Packing prompts into one row was tried first and lost on CPU (quadratic attention over the row:
+      2.3x slower than one pass each at 16 prompts, padded 1.05x faster). Matches per-prompt prefill on CPU;
+      to measure on Kaggle (`engine_full`, `prefill_*` bench rows)
+- [x] CUDA graphs are the default for `gpt2_serve` on CUDA (`--no-cuda-graphs` to turn off). The next Kaggle run
+      re-measures eager vs graphs in a second session; revert the default if it does not hold
 - [x] Streaming decode re-decoded the whole output per token (O(n^2), under a shared lock): now O(1) per token
 - [ ] Custom CUDA decode-attention kernel (needs nvcc on Kaggle), compare vs LibTorch
 - [ ] Paged KV cache (block table + allocator), best combined with the custom kernel
@@ -272,9 +278,10 @@ capacity ~50 req/s (~3200 tok/s), continuous batching -95% first-token latency v
 
 ## Phase 9 — Polish (3–4 days)
 
-- [ ] README: architecture diagram, build/run (WSL2 + Docker + Kaggle), API, charts
-- [ ] "What I learned": each optimisation → measured effect
-- [ ] Honest notes: fp16 divergence, T4 limits (no FlashAttention), CPU-bound decode at low batch
-- [ ] Dockerfile (CPU, multi-stage with Rust + LibTorch builder), `docker run` instructions
-- [ ] 2–3 min demo video: streaming under load (recorded locally on CPU)
-- [ ] License, clean up TODOs, tag `v1.0`
+- [x] README: architecture diagram, build/run (Docker, Linux/WSL2, Kaggle), API, flags, charts
+- [x] "What each optimisation bought": each optimisation → measured effect
+- [x] Honest notes: fp16 divergence, T4 limits (no FlashAttention), launch-bound decode at low batch, no paging
+- [x] Dockerfile (CPU, four stages: toolchain, build + tests, weights export, runtime), `docker run` instructions
+- [ ] 2–3 min demo video: streaming under load (recorded locally on CPU) — Ujjwal
+- [x] License (MIT), TODOs cleaned up
+- [ ] Tag `v1.0` once the next Kaggle run has measured batched prefill and the 64-token buckets
