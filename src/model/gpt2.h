@@ -41,6 +41,12 @@ class GPT2Model {
   // fills cache slot `slot`, and returns logits for the LAST position only, [1, vocab].
   torch::Tensor prefill(const torch::Tensor& ids, int64_t slot, KVCache& cache, int64_t start_pos = 0) const;
 
+  // Prefill for several sequences in one pass. The prompts are laid end to end in a single row
+  // and each attends only to its own tokens, so no work goes to padding. Prompt i fills cache
+  // slot first_slot + i from position 0. Returns logits at each prompt's last token, [n, vocab].
+  torch::Tensor prefill_packed(const std::vector<std::vector<int64_t>>& prompts, int64_t first_slot,
+                               KVCache& cache) const;
+
   // Padded prefill for static batching: ids/positions/padding_mask are [B, T] (left padded,
   // see scheduler/padding.h) and fill slots 0..B-1 keeping the padded layout.
   // Returns logits at the last column, [B, vocab] - valid for every row because padding is on the left.

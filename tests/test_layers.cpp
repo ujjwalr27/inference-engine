@@ -93,6 +93,21 @@ TEST_F(Layers, PaddedKeysAreIgnored) {
   EXPECT_FALSE(got.isnan().any().item<bool>()) << "fully masked pad rows must not produce NaN";
 }
 
+// Three sequences of 2, 1 and 3 tokens laid end to end: each token sees only earlier tokens of
+// its own sequence.
+TEST_F(Layers, PackedMaskIsBlockDiagonalAndCausal) {
+  const auto allowed = gpt2::build_packed_mask(torch::tensor({0, 0, 1, 2, 2, 2}, torch::kInt64));
+  ASSERT_EQ(allowed.sizes(), (std::vector<int64_t>{1, 1, 6, 6}));
+  const auto expected = torch::tensor({{1, 0, 0, 0, 0, 0},
+                                       {1, 1, 0, 0, 0, 0},
+                                       {0, 0, 1, 0, 0, 0},
+                                       {0, 0, 0, 1, 0, 0},
+                                       {0, 0, 0, 1, 1, 0},
+                                       {0, 0, 0, 1, 1, 1}})
+                            .to(torch::kBool);
+  EXPECT_TRUE(torch::equal(allowed[0][0], expected));
+}
+
 TEST_F(Layers, BlockPreservesShape) {
   gpt2::Block b;
   b.ln_1 = {torch::ones({16}), torch::zeros({16}), 1e-5};

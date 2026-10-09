@@ -22,6 +22,11 @@ double mask_fill_value(torch::Dtype dtype);
 // padding_mask: [B, T] bool, true = real token; undefined = no padding.
 torch::Tensor build_attention_mask(int64_t seq_len, const torch::Tensor& padding_mask, torch::Device device);
 
+// Packed-prefill mask [1, 1, N, N] for several sequences laid end to end in one row:
+// token i may attend to token j when both belong to the same sequence and j <= i.
+// sequence: [N] int64, which sequence each token belongs to (non-decreasing).
+torch::Tensor build_packed_mask(const torch::Tensor& sequence);
+
 // Decode-step mask [B, 1, 1, length]: row i may attend to keys 0..positions[i].
 // Returns an undefined tensor when every row attends to the whole length (nothing to mask),
 // unless `always` is set: a length padded past max(positions) + 1 needs the mask even for one row.
@@ -56,6 +61,12 @@ struct Attention {
   torch::Tensor forward_prefill_batch(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
                                       int64_t start_pos, KVCache& cache) const;
 
+  // Packed prefill: x [1, N, D] holds several sequences end to end; token i's key/value goes to
+  // cache slot slots[i] at position positions[i]. allowed comes from build_packed_mask.
+  torch::Tensor forward_prefill_packed(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
+                                       const torch::Tensor& slots, const torch::Tensor& positions,
+                                       KVCache& cache) const;
+
   // Decode: x [B, 1, D] for slots 0..B-1. Writes this step's key/value at cache_index[i],
   // then attends over cached positions [0, length). allowed may be undefined (nothing masked).
   torch::Tensor forward_decode(const torch::Tensor& x, const torch::Tensor& cache_index, int64_t layer,
@@ -85,6 +96,9 @@ struct Block {
                                 int64_t start_pos, KVCache& cache) const;
   torch::Tensor forward_prefill_batch(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
                                       int64_t start_pos, KVCache& cache) const;
+  torch::Tensor forward_prefill_packed(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
+                                       const torch::Tensor& slots, const torch::Tensor& positions,
+                                       KVCache& cache) const;
   torch::Tensor forward_decode(const torch::Tensor& x, const torch::Tensor& cache_index, int64_t layer,
                                int64_t length, const torch::Tensor& allowed, KVCache& cache) const;
 };

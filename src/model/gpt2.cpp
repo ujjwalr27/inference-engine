@@ -107,6 +107,44 @@ torch::Tensor GPT2Model::prefill(const torch::Tensor& ids, int64_t slot, KVCache
   return torch::linear(x, wte_).squeeze(1);
 }
 
+torch::Tensor GPT2Model::prefill_packed(const std::vector<std::vector<int64_t>>& prompts, int64_t first_slot,
+                                        KVCache& cache) const {
+  const auto n = static_cast<int64_t>(prompts.size());
+  TORCH_CHECK(n >= 1, "prefill_packed needs at least one prompt");
+  TORCH_CHECK(first_slot >= 0 && first_slot + n <= cache.n_slots(), "slots [", first_slot, ", ", first_slot + n,
+              ") outside the cache's ", cache.n_slots());
+
+  // Built on the host, where the bounds can be checked without a device sync, then copied once.
+  std::vector<int64_t> ids, positions, slots, sequence, last;
+  for (int64_t i = 0; i < n; ++i) {
+    const auto& prompt = prompts[static_cast<size_t>(i)];
+    const auto T = static_cast<int64_t>(prompt.size());
+    TORCH_CHECK(T >= 1 && T <= cfg_.n_ctx, "prompt ", i, " has ", T, " tokens, outside [1, ", cfg_.n_ctx, "]");
+    for (int64_t t = 0; t < T; ++t) {
+      TORCH_CHECK(prompt[static_cast<size_t>(t)] >= 0 && prompt[static_cast<size_t>(t)] < cfg_.vocab_size,
+                  "token id out of range in prompt ", i);
+      positions.push_back(t);
+      slots.push_back(first_slot + i);
+      sequence.push_back(i);
+    }
+    ids.insert(ids.end(), prompt.begin(), prompt.end());
+    last.push_back(static_cast<int64_t>(ids.size()) - 1);
+  }
+
+  torch::InferenceMode guard;
+  auto on_device = [&](const std::vector<int64_t>& v) { return torch::tensor(v, torch::kInt64).to(device_); };
+  const auto dev_positions = on_device(positions);
+  const auto dev_slots = on_device(slots);
+  auto x = (torch::embedding(wte_, on_device(ids)) + torch::embedding(wpe_, dev_positions)).unsqueeze(0);
+
+  const auto allowed = build_packed_mask(on_device(sequence));
+  for (int64_t layer = 0; layer < cfg_.n_layer; ++layer) {
+    x = blocks_[static_cast<size_t>(layer)].forward_prefill_packed(x, allowed, layer, dev_slots, dev_positions, cache);
+  }
+  x = ln_f_(x.index_select(1, on_device(last)));  // [1, n, D]: only each prompt's last token
+  return torch::linear(x, wte_).squeeze(0);
+}
+
 torch::Tensor GPT2Model::prefill_batch(const torch::Tensor& ids, const torch::Tensor& positions,
                                        const torch::Tensor& padding_mask, KVCache& cache) const {
   TORCH_CHECK(ids.dim() == 2, "prefill_batch expects ids [B, T], got ", ids.sizes());

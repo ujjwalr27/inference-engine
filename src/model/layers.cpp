@@ -31,6 +31,13 @@ torch::Tensor build_attention_mask(int64_t seq_len, const torch::Tensor& padding
   return allowed;
 }
 
+torch::Tensor build_packed_mask(const torch::Tensor& sequence) {
+  TORCH_CHECK(sequence.dim() == 1, "sequence must be [N]");
+  const int64_t n = sequence.size(0);
+  const auto same_sequence = sequence.view({n, 1}) == sequence.view({1, n});
+  return same_sequence.tril().view({1, 1, n, n});
+}
+
 torch::Tensor build_decode_mask(const torch::Tensor& positions, int64_t length, bool always) {
   TORCH_CHECK(positions.dim() == 1, "positions must be [batch]");
   if (positions.size(0) == 1 && !always) return {};  // the single row covers the whole cached length
@@ -86,6 +93,15 @@ torch::Tensor Attention::forward_prefill_batch(const torch::Tensor& x, const tor
   return attend(q, k, v, allowed);
 }
 
+torch::Tensor Attention::forward_prefill_packed(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
+                                                const torch::Tensor& slots, const torch::Tensor& positions,
+                                                KVCache& cache) const {
+  TORCH_CHECK(x.size(0) == 1, "a packed prefill holds its sequences in one row");
+  auto [q, k, v] = project(x);
+  cache.write_packed(layer, slots, positions, k, v);
+  return attend(q, k, v, allowed);
+}
+
 torch::Tensor Attention::forward_decode(const torch::Tensor& x, const torch::Tensor& cache_index, int64_t layer,
                                         int64_t length, const torch::Tensor& allowed, KVCache& cache) const {
   TORCH_CHECK(x.size(1) == 1, "decode consumes exactly one token per row");
@@ -111,6 +127,13 @@ torch::Tensor Block::forward_prefill(const torch::Tensor& x, const torch::Tensor
 torch::Tensor Block::forward_prefill_batch(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
                                            int64_t start_pos, KVCache& cache) const {
   auto h = x + attn.forward_prefill_batch(ln_1(x), allowed, layer, start_pos, cache);
+  return h + mlp.forward(ln_2(h));
+}
+
+torch::Tensor Block::forward_prefill_packed(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
+                                            const torch::Tensor& slots, const torch::Tensor& positions,
+                                            KVCache& cache) const {
+  auto h = x + attn.forward_prefill_packed(ln_1(x), allowed, layer, slots, positions, cache);
   return h + mlp.forward(ln_2(h));
 }
 
