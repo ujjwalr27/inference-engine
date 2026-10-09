@@ -139,7 +139,8 @@ INK, INK_2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e5e1", "#fcfcfb"
 SLOT_1, SLOT_2 = "#2a78d6", "#eb6834"
 SLOT_3 = "#1baf7a"  # aqua, Hugging Face; under 3:1 on the surface, so its values are always labelled
 SLOT_5 = "#e87ba4"  # magenta, vLLM; under 3:1 on the surface, so its lines are always labelled
-SLOT_7 = "#4a3aa7"  # violet, the engine with CUDA graphs
+SLOT_7 = "#4a3aa7"  # violet, the engine with CUDA graphs (and, when measured, everything else on)
+PREVIOUS = "#8b8fa3"  # grey, an earlier configuration shown for reference; always labelled directly
 
 
 def readme_style() -> None:
@@ -235,10 +236,26 @@ def chart_ttft_vs_rate(results: Path, out: Path, context: str) -> None:
 
 
 def chart_policy_at_rate(results: Path, rate: float, out: Path, context: str) -> None:
-    if not (results / f"continuous_rate{rate:g}.csv").exists() or not (results / f"static_rate{rate:g}.csv").exists():
+    chart_policy(results / f"continuous_rate{rate:g}.csv", results / f"static_rate{rate:g}.csv", out, context,
+                 f"At {rate:g} req/s")
+
+
+def chart_policy_varied(results: Path, out: Path, context: str) -> None:
+    """kaggle_sweep.py section 5: the same comparison with output lengths drawn from a range."""
+    cont, stat = results / "varied_continuous.csv", results / "varied_static.csv"
+    if not cont.exists() or not stat.exists():
         return
-    cont = summary(results / f"continuous_rate{rate:g}.csv")
-    stat = summary(results / f"static_rate{rate:g}.csv")
+    lengths = pd.concat([load(cont), load(stat)])
+    lengths = lengths[lengths["ok"]]["output_tokens"]
+    span = f"{lengths.min()}–{lengths.max()} output tokens"
+    chart_policy(cont, stat, out, context.replace("64 output tokens", span), f"With {span}")
+
+
+def chart_policy(cont_path: Path, stat_path: Path, out: Path, context: str, lead: str) -> None:
+    if not cont_path.exists() or not stat_path.exists():
+        return
+    cont = summary(cont_path)
+    stat = summary(stat_path)
     fig, (left, right) = plt.subplots(1, 2, figsize=(9, 4.2), gridspec_kw={"width_ratios": [2, 1]})
 
     metrics = [("ttft_p50", "p50"), ("ttft_p99", "p99")]
@@ -264,8 +281,10 @@ def chart_policy_at_rate(results: Path, rate: float, out: Path, context: str) ->
     for ax in (left, right):
         tidy(ax)
     reduction = 1 - cont["ttft_p50"] / stat["ttft_p50"]
-    fig.suptitle(f"At {rate:g} req/s, continuous batching cuts first-token latency {reduction:.0%} "
-                 f"at the same throughput", x=0.01, ha="left", fontsize=12, fontweight="bold")
+    ratio = cont["tokens_per_s"] / stat["tokens_per_s"]
+    rest = "at the same throughput" if abs(ratio - 1) < 0.05 else f"and serves {ratio:.2f}x the tokens per second"
+    fig.suptitle(f"{lead}, continuous batching cuts first-token latency {reduction:.0%} {rest}",
+                 x=0.01, ha="left", fontsize=12, fontweight="bold")
     footnote(fig, context + f" · throughput {cont['tokens_per_s']:.0f} vs {stat['tokens_per_s']:.0f} output tok/s")
     fig.tight_layout(rect=(0, 0.05, 1, 0.94))
     save(fig, out)
@@ -346,6 +365,41 @@ def chart_decode_step(results: Path, out: Path, context: str) -> None:
     save(fig, out)
 
 
+def chart_prefill_packing(results: Path, out: Path, context: str) -> None:
+    """gpt2_bench: n prompts prefilled one pass each (with a read-back after each) against one packed pass."""
+    path = next((results / f"bench_{run}.csv" for run in ("fp16_graphs", "fp16")
+                 if (results / f"bench_{run}.csv").exists()), None)
+    if path is None:
+        return
+    bench = pd.read_csv(path)
+    solo = bench[bench["phase"] == "prefill_solo"].set_index("batch")["ms"]
+    packed = bench[bench["phase"] == "prefill_packed"].set_index("batch")["ms"]
+    counts = sorted(set(solo.index) & set(packed.index))
+    if not counts:
+        return
+    length = int(bench[bench["phase"] == "prefill_packed"]["length"].iloc[0])
+    fig, ax = plt.subplots(figsize=(8, 4.4))
+    width = 0.38
+    for j, (series, color, label) in enumerate(((solo, PREVIOUS, "one pass per prompt"),
+                                                (packed, SLOT_1, "one packed pass"))):
+        xs = [i + (j - 0.5) * width for i in range(len(counts))]
+        values = [series[n] for n in counts]
+        ax.bar(xs, values, width=width, color=color, edgecolor=SURFACE, linewidth=2, label=label)
+        for x, v in zip(xs, values):
+            ax.text(x, v, f"{v:.1f}", ha="center", va="bottom", fontsize=9, color=INK)
+    ax.set_xticks(range(len(counts)), [str(n) for n in counts])
+    ax.set_xlabel(f"prompts admitted in the same step ({length} tokens each)")
+    ax.set_ylabel("ms until every first token is on the host")
+    ax.legend(loc="upper left")
+    tidy(ax)
+    n = counts[-1]
+    fig.suptitle(f"Packing {n} prompts into one prefill pass: {packed[n]:.1f} ms instead of {solo[n]:.1f} ms "
+                 f"({solo[n] / packed[n]:.1f}x)", x=0.01, ha="left", fontsize=12, fontweight="bold")
+    footnote(fig, context.split(" · ")[0] + f" · {bench['dtype'].iloc[0]} · gpt2_bench, device synchronised")
+    fig.tight_layout(rect=(0, 0.05, 1, 0.93))
+    save(fig, out)
+
+
 def chart_baseline(results: Path, out: Path, context: str) -> None:
     """Engine vs plain Hugging Face transformers (scripts/kaggle_baseline.py) under the same load."""
     servers = (("engine", "this engine", SLOT_1), ("huggingface", "Hugging Face generate()", SLOT_3))
@@ -414,9 +468,12 @@ def baseline_points(results: Path, server: str) -> pd.DataFrame:
 
 
 def chart_engine_vs_vllm(results: Path, out: Path, context: str) -> None:
-    """The engine with and without CUDA graphs against vLLM (kaggle_baseline.py, one session)."""
+    """The engine, eager and at its best, against vLLM (kaggle_baseline.py, one session)."""
+    full = not baseline_points(results, "engine_full").empty
+    best = "engine_full" if full else "engine_graphs"
+    best_label = "engine + CUDA graphs + batched prefill" if full else "engine + CUDA graphs"
     # (key, label, colour, vertical offset of its value label: the two low lines sit close together)
-    servers = (("engine", "engine", SLOT_1, 0), ("engine_graphs", "engine + CUDA graphs", SLOT_7, -7),
+    servers = (("engine", "engine, no graphs", SLOT_1, 0), (best, best_label, SLOT_7, -7),
                ("vllm", "vLLM", SLOT_5, 7))
     points = {key: baseline_points(results, key) for key, *_ in servers}
     if any(points[key].empty for key, *_ in servers):
@@ -447,17 +504,63 @@ def chart_engine_vs_vllm(results: Path, out: Path, context: str) -> None:
     right.set_title("Time to first token (p50)")
 
     low = rates[0]
-    eager, graphs, vllm = (points[key].loc[low, "tpot_p50"] for key in ("engine", "engine_graphs", "vllm"))
-    fig.suptitle(f"CUDA graphs cut the engine's time per token {eager / graphs:.1f}x at {low:g} req/s: "
-                 f"{graphs:.1f} ms against vLLM's {vllm:.1f} ms", x=0.01, ha="left", fontsize=12, fontweight="bold")
+    eager, ours, vllm = (points[key].loc[low, "tpot_p50"] for key in ("engine", best, "vllm"))
+    fig.suptitle(f"CUDA graphs cut the engine's time per token {eager / ours:.1f}x at {low:g} req/s: "
+                 f"{ours:.1f} ms against vLLM's {vllm:.1f} ms", x=0.01, ha="left", fontsize=12, fontweight="bold")
     top = rates[-1]
     tps = {key: points[key].loc[top, "tokens_per_s"] for key, *_ in servers}
     footnote(fig, context.replace(" · 32 slots", "") + " · at most 32 sequences in flight on both servers · "
              "vLLM 0.31 (Triton attention: FlashAttention needs a newer GPU)\n"
-             f"Throughput at {top:g} req/s: {tps['engine_graphs']:.0f} (engine + graphs), {tps['vllm']:.0f} (vLLM), "
-             f"{tps['engine']:.0f} (engine) output tokens/s")
+             f"Throughput at {top:g} req/s: {tps[best]:.0f} (engine at its best), {tps['vllm']:.0f} (vLLM), "
+             f"{tps['engine']:.0f} (engine, no graphs) output tokens/s")
     fig.tight_layout(rect=(0, 0.12, 1, 0.93))
     save(fig, out, relayout=False)
+
+
+def chart_batched_prefill(results: Path, out: Path, context: str) -> None:
+    """engine_graphs (one prefill pass per request) against engine_full (batched prefill), one session."""
+    before, after = baseline_points(results, "engine_graphs"), baseline_points(results, "engine_full")
+    if before.empty or after.empty:
+        return
+    rates = sorted(set(before.index) & set(after.index))
+    fig, (left, right) = plt.subplots(1, 2, figsize=(11, 4.6))
+    series = ((before, "one prefill pass per request", PREVIOUS), (after, "batched prefill", SLOT_7))
+    ttft_values = []
+    ends = [d.loc[rates[-1], "tokens_per_s"] for d, *_ in series]
+    for (d, label, color), end in zip(series, ends):
+        d = d.loc[rates]
+        left.plot(rates, d["ttft_p99"], color=color, marker="o", label=label)
+        right.plot(rates, d["tokens_per_s"], color=color, marker="o", label=label)
+        ttft_values += list(d["ttft_p99"])
+        # The two lines often end close together: the higher label goes above, the lower below.
+        dy = 7 if end >= max(ends) else -7
+        right.annotate(f"{end:.0f}", (rates[-1], end), xytext=(8, dy), textcoords="offset points",
+                       ha="left", va="center", fontsize=9, color=INK)
+    for ax in (left, right):
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(rates, [f"{r:g}" for r in rates])
+        ax.set_xlabel("offered load (requests per second)")
+        tidy(ax)
+    log_ms_axis(left, ttft_values, 0.6, 2.5)
+    left.set_ylabel("milliseconds (log scale)")
+    left.set_title("Time to first token (p99)")
+    left.legend(loc="upper left")
+    right.set_xlim(rates[0] / 1.3, rates[-1] * 1.5)
+    right.set_ylim(0, max(before["tokens_per_s"].max(), after["tokens_per_s"].max()) * 1.15)
+    right.set_ylabel("output tokens per second")
+    right.set_title("Throughput")
+
+    top = rates[-1]
+    gain = after.loc[top, "tokens_per_s"] / before.loc[top, "tokens_per_s"]
+    def short(ms: float) -> str:
+        return f"{ms:.0f} ms" if ms < 1000 else f"{ms / 1000:.1f} s"
+
+    fig.suptitle(f"Batched prefill at {top:g} req/s: p99 first token {short(before.loc[top, 'ttft_p99'])} → "
+                 f"{short(after.loc[top, 'ttft_p99'])}, throughput {gain:.2f}x",
+                 x=0.01, ha="left", fontsize=12, fontweight="bold")
+    footnote(fig, context + " · both with CUDA graphs (128-token length buckets before, 64 after)")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.93))
+    save(fig, out)
 
 
 def cmd_readme(args) -> None:
@@ -467,10 +570,13 @@ def cmd_readme(args) -> None:
     readme_style()
     chart_ttft_vs_rate(results, out_dir / "ttft_vs_rate.png", context)
     chart_policy_at_rate(results, args.rate, out_dir / "continuous_vs_static.png", context)
+    chart_policy_varied(results, out_dir / "continuous_vs_static_varied.png", context)
     chart_slots(results, out_dir / "slots_vs_throughput.png", context)
     chart_decode_step(results, out_dir / "decode_step_vs_batch.png", context)
     chart_baseline(results, out_dir / "engine_vs_huggingface.png", context)
     chart_engine_vs_vllm(results, out_dir / "engine_vs_vllm.png", context)
+    chart_prefill_packing(results, out_dir / "prefill_packing.png", context)
+    chart_batched_prefill(results, out_dir / "batched_prefill.png", context)
 
 
 def main() -> None:
