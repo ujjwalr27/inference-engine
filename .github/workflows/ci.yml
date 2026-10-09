@@ -8,12 +8,40 @@ env:
   LIBTORCH_VERSION: 2.10.0
 
 jobs:
+  # GPT-2's weights and the Hugging Face reference outputs the model tests compare against.
+  # Exported once and cached until either script changes.
+  weights:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache exported weights
+        id: cache-weights
+        uses: actions/cache@v4
+        with:
+          path: weights
+          key: weights-${{ hashFiles('scripts/export_weights.py', 'scripts/reference.py') }}
+
+      - uses: actions/setup-python@v5
+        if: steps.cache-weights.outputs.cache-hit != 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Export weights and reference data
+        if: steps.cache-weights.outputs.cache-hit != 'true'
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch==${LIBTORCH_VERSION}"
+          pip install "transformers>=5" safetensors
+          python scripts/export_weights.py
+          python scripts/reference.py --threads 4
+
   build-test-cpu:
+    needs: weights
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
@@ -32,17 +60,76 @@ jobs:
             "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip"
           unzip -q /tmp/libtorch.zip -d ~
 
+      - name: Restore weights
+        uses: actions/cache/restore@v4
+        with:
+          path: weights
+          key: weights-${{ hashFiles('scripts/export_weights.py', 'scripts/reference.py') }}
+          fail-on-cache-miss: true
+
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH=$HOME/libtorch
 
       - name: Build
         run: cmake --build build -j 4
 
+      # Every test runs, the model ones included; GPT2_STRESS=1 widens the scheduler stress test
+      # to the 100 staggered requests from the plan. Only the CUDA tests skip.
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        env:
+          GPT2_STRESS: "1"
+        run: ctest --test-dir build --output-on-failure -j 2
 
       - name: Hello tensor
         run: ./build/hello_tensor cpu
+
+  # The whole suite, model tests included, under AddressSanitizer and UBSan. Only the engine's
+  # own code is instrumented; LibTorch's kernels are prebuilt and run at full speed.
+  asan:
+    needs: weights
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Cache LibTorch
+        id: cache-libtorch
+        uses: actions/cache@v4
+        with:
+          path: ~/libtorch
+          key: libtorch-${{ env.LIBTORCH_VERSION }}-cpu
+
+      - name: Download LibTorch
+        if: steps.cache-libtorch.outputs.cache-hit != 'true'
+        run: |
+          curl -fL --retry 3 -o /tmp/libtorch.zip \
+            "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip"
+          unzip -q /tmp/libtorch.zip -d ~
+
+      - name: Restore weights
+        uses: actions/cache/restore@v4
+        with:
+          path: weights
+          key: weights-${{ hashFiles('scripts/export_weights.py', 'scripts/reference.py') }}
+          fail-on-cache-miss: true
+
+      - name: Configure with AddressSanitizer
+        run: |
+          cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_PREFIX_PATH=$HOME/libtorch -DGPT2_ENABLE_ASAN=ON
+
+      - name: Build tests
+        run: cmake --build build-asan --target gpt2_tests -j 4
+
+      - name: Run the suite under ASan
+        env:
+          GPT2_STRESS: "1"
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ./build-asan/gpt2_tests
 
   # Threading checks only. The model tests skip themselves (no weights here), which also keeps
   # TSan away from the prebuilt, uninstrumented LibTorch kernels.
@@ -51,7 +138,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
