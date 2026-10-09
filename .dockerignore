@@ -1,0 +1,15 @@
+.git
+build
+build-*
+weights
+results
+results_*
+**/__pycache__
+.venv
+.vscode
+.idea
+# Nested submodules the build does not use (CMakeLists.txt builds only the tokenizer crate)
+third_party/tokenizers-cpp/sentencepiece
+third_party/tokenizers-cpp/msgpack
+third_party/tokenizers-cpp/web
+third_party/tokenizers-cpp/example
