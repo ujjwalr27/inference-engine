@@ -35,6 +35,10 @@ struct SchedulerOptions {
   int64_t n_slots = 8;                // concurrent requests held in the KV cache
   size_t max_queue = 64;              // waiting requests before new ones are rejected
   int64_t prefill_budget_tokens = 512;  // prompt tokens admitted per step; caps the decode pause
+
+  // Prefill the requests admitted in one step together, in packed passes of about
+  // prefill_budget_tokens each (GPT2Model::prefill_packed), instead of one pass per request.
+  bool batch_prefill = true;
   std::chrono::milliseconds idle_wait{20};
 
   // Static policy only: how many requests to gather, and how long to wait for them before
@@ -45,6 +49,9 @@ struct SchedulerOptions {
   // Replay decode steps from CUDA graphs (model/decode_graphs.h). CUDA only; the graphs are
   // captured when the scheduler is constructed, so construction takes a second or two longer.
   bool cuda_graphs = false;
+  // Cache lengths are rounded up to a multiple of this to pick a graph. Smaller steps waste less
+  // attention on padding but capture more graphs (6 batch buckets x 1024 / step at 32 slots).
+  int64_t graph_length_step = 64;
 };
 
 struct SchedulerStats {
@@ -66,6 +73,7 @@ struct SchedulerStats {
   // publishing tokens, finishing requests and compacting their slots.
   double prefill_ms = 0;        // prompt forward passes, first token included
   uint64_t prefill_tokens = 0;
+  uint64_t prefill_passes = 0;  // forward passes those prompts took; fewer than admitted when batched
   double decode_ms = 0;         // decode steps: inputs in, forward, argmax, tokens out
   double busy_ms = 0;           // every loop iteration except the time spent idle or gathering
 };
@@ -97,6 +105,8 @@ class Scheduler {
   // How many requests may be admitted right now, and whether the prefill budget applies.
   // Returns 0 when the policy says to wait.
   size_t admission_limit(bool& apply_budget);
+  // Prefills these requests in one pass, gives them the next slots, and publishes their first tokens.
+  void prefill(const std::vector<std::shared_ptr<Request>>& requests);
   void step();
   void finish(size_t index, FinishReason reason);  // publishes, then frees the slot
   void release_slot(size_t index);                 // compacts the last active slot into this one

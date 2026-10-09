@@ -190,10 +190,12 @@ void InferenceServer::Impl::install_routes() {
                          {"batches", s.batches},
                          {"prefill_ms", s.prefill_ms},
                          {"prefill_tokens", s.prefill_tokens},
+                         {"prefill_passes", s.prefill_passes},
                          {"decode_ms", s.decode_ms},
                          {"busy_ms", s.busy_ms},
                          {"policy", to_string(scheduler.options().policy)},
                          {"cuda_graphs", scheduler.options().cuda_graphs},
+                         {"batch_prefill", scheduler.options().batch_prefill},
                          {"slots", scheduler.options().n_slots},
                          {"max_queue", scheduler.options().max_queue}}
                         .dump(),

@@ -103,6 +103,7 @@ TEST_F(SchedulerTest, SingleRequestMatchesSoloGeneration) {
   // The time split must account for the work: one prefill of the prompt, 19 decode steps,
   // and both inside the busy time.
   EXPECT_EQ(stats.prefill_tokens, prompt.size());
+  EXPECT_EQ(stats.prefill_passes, 1u);
   EXPECT_GT(stats.prefill_ms, 0.0);
   EXPECT_EQ(stats.decode_steps, 19u);
   EXPECT_GT(stats.decode_ms, 0.0);
@@ -185,6 +186,78 @@ TEST_F(SchedulerTest, StaggeredRequestsMatchTheirSoloRuns) {
       EXPECT_LT(gap, kNearTieGap) << "divergence at a clear argmax is a real bug";
     }
   }
+}
+
+// Requests already waiting when a step starts are prefilled together. Queue four before the
+// scheduler starts, so the first step admits all of them: one packed pass with the prefill on,
+// four passes with it off, and the same answers either way.
+TEST_F(SchedulerTest, WaitingRequestsArePrefilledInOnePass) {
+  std::mt19937 rng(11);
+  std::vector<std::vector<int64_t>> prompts;
+  for (int i = 0; i < 4; ++i) prompts.push_back(slice_prompt(rng));
+  gpt2::GenerationOptions gen;
+  gen.max_new_tokens = 12;
+  gen.stop_on_eos = false;
+
+  gpt2::KVCache solo_cache(model_->config(), 1, model_->device(), model_->dtype());
+  std::vector<std::vector<int64_t>> expected;
+  for (const auto& p : prompts) {
+    expected.push_back(gpt2::generate_cached(*model_, p, gen, &solo_cache).tokens);
+  }
+
+  for (bool batch_prefill : {true, false}) {
+    SCOPED_TRACE(batch_prefill ? "batched prefill" : "one pass per request");
+    gpt2::SchedulerOptions options;
+    options.n_slots = 4;
+    options.batch_prefill = batch_prefill;
+    gpt2::Scheduler scheduler(*model_, options);
+    std::vector<std::shared_ptr<gpt2::Request>> requests;
+    for (const auto& p : prompts) requests.push_back(scheduler.submit(p, gen));
+    scheduler.start();
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+      ASSERT_NE(requests[i], nullptr);
+      const auto tokens = requests[i]->out->collect();
+      const int64_t d = first_difference(tokens, expected[i]);
+      if (d >= 0) {  // tolerated only at a near-tie between the top two logits
+        std::vector<int64_t> prefix = prompts[i];
+        prefix.insert(prefix.end(), expected[i].begin(), expected[i].begin() + d);
+        const double gap =
+            gpt2::test::top2_gap(model_->forward(torch::tensor(prefix, torch::kInt64).unsqueeze(0))[0][-1]);
+        EXPECT_LT(gap, kNearTieGap) << "request " << i << " diverged at token " << d;
+      }
+    }
+    scheduler.stop();
+    const auto stats = scheduler.stats();
+    EXPECT_EQ(stats.admitted, 4u);
+    EXPECT_EQ(stats.prefill_passes, batch_prefill ? 1u : 4u);
+    EXPECT_EQ(stats.max_batch, 4);
+  }
+}
+
+// A static batch is prefilled whole, without the per-step budget, but still in passes of about
+// the budget's size, so one pass's attention scores (quadratic in its tokens) stay bounded.
+TEST_F(SchedulerTest, StaticBatchPrefillIsSplitIntoBudgetSizedPasses) {
+  std::vector<std::vector<int64_t>> prompts(4, std::vector<int64_t>(corpus_.begin(), corpus_.begin() + 10));
+  gpt2::GenerationOptions gen;
+  gen.max_new_tokens = 3;
+
+  gpt2::SchedulerOptions options;
+  options.policy = gpt2::BatchingPolicy::Static;
+  options.n_slots = 4;
+  options.prefill_budget_tokens = 16;  // two 10-token prompts reach it
+  gpt2::Scheduler scheduler(*model_, options);
+  std::vector<std::shared_ptr<gpt2::Request>> requests;
+  for (const auto& p : prompts) requests.push_back(scheduler.submit(p, gen));
+  scheduler.start();
+  std::vector<std::vector<int64_t>> outputs;
+  for (auto& r : requests) outputs.push_back(r->out->collect());
+  scheduler.stop();
+
+  const auto stats = scheduler.stats();
+  EXPECT_EQ(stats.batches, 1u);
+  EXPECT_EQ(stats.prefill_passes, 2u);
+  for (const auto& out : outputs) EXPECT_EQ(out, outputs[0]) << "identical prompts, identical answers";
 }
 
 TEST_F(SchedulerTest, CancellationFreesTheSlotWithoutDisturbingOthers) {

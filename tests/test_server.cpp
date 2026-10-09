@@ -109,7 +109,7 @@ TEST_F(ServerTest, HealthAndStats) {
   const auto body = json::parse(stats->body);
   EXPECT_EQ(body.at("slots"), 4);
   EXPECT_EQ(body.at("submitted"), 0);
-  for (const char* key : {"prefill_ms", "prefill_tokens", "decode_ms", "busy_ms"}) {
+  for (const char* key : {"prefill_ms", "prefill_tokens", "prefill_passes", "decode_ms", "busy_ms", "batch_prefill"}) {
     EXPECT_TRUE(body.contains(key)) << key;
   }
 }

@@ -32,6 +32,7 @@ Scheduler::Scheduler(const GPT2Model& model, const SchedulerOptions& options)
       queue_(options.max_queue) {
   if (options_.n_slots < 1) throw std::invalid_argument("n_slots must be at least 1");
   if (options_.prefill_budget_tokens < 1) throw std::invalid_argument("prefill budget must be at least 1");
+  if (options_.graph_length_step < 1) throw std::invalid_argument("graph length step must be at least 1");
   active_.reserve(static_cast<size_t>(options_.n_slots));
 
   auto host_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
@@ -41,7 +42,7 @@ Scheduler::Scheduler(const GPT2Model& model, const SchedulerOptions& options)
 
   if (options_.cuda_graphs) {
     // Capture now, while no request holds a slot: capturing writes to the cache at position 0.
-    graphs_ = std::make_unique<DecodeGraphs>(model, cache_);
+    graphs_ = std::make_unique<DecodeGraphs>(model, cache_, options_.graph_length_step);
     graphs_->capture_all();
   }
 }
@@ -159,8 +160,10 @@ size_t Scheduler::admission_limit(bool& apply_budget) {
 void Scheduler::admit() {
   bool apply_budget = true;
   size_t remaining = admission_limit(apply_budget);
-  int64_t prefill_tokens = 0;
-  while (remaining > 0 && (!apply_budget || prefill_tokens < options_.prefill_budget_tokens)) {
+  int64_t admitted_tokens = 0;
+  std::vector<std::shared_ptr<Request>> pass;  // requests for the next prefill pass
+  int64_t pass_tokens = 0;
+  while (remaining > 0 && (!apply_budget || admitted_tokens < options_.prefill_budget_tokens)) {
     auto request = queue_.try_pop();
     if (!request) break;
     --remaining;
@@ -173,42 +176,78 @@ void Scheduler::admit() {
       continue;
     }
 
-    const int64_t slot = static_cast<int64_t>(active_.size());
-    request->slot = slot;
-    request->t_prefill_start = SchedClock::now();
-
-    const auto ids = torch::tensor(request->prompt, torch::kInt64).unsqueeze(0);
-    const auto logits = model_.prefill(ids, slot, cache_);
-    const int64_t first = logits[0].argmax(-1).item<int64_t>();
-
-    request->position = static_cast<int64_t>(request->prompt.size());
-    request->next_token = first;
-    request->generated.push_back(first);
-    request->t_first_token = SchedClock::now();
-    request->out->push(first);
-    prefill_tokens += static_cast<int64_t>(request->prompt.size());
-
-    active_.push_back(request);
-    {
-      std::lock_guard<std::mutex> lock(stats_mutex_);
-      ++stats_.admitted;
-      ++stats_.generated_tokens;
-      stats_.prefill_ms += ms_since(request->t_prefill_start, request->t_first_token);
-      stats_.prefill_tokens += request->prompt.size();
-      stats_.max_batch = std::max<int64_t>(stats_.max_batch, static_cast<int64_t>(active_.size()));
-      stats_.active = static_cast<int64_t>(active_.size());
-      stats_.queued = queue_.size();
+    // A pass is closed once it reaches the budget, the same rule that ends admission, so with the
+    // budget applied everything admitted goes in one pass. Without it (a static batch), the cap
+    // keeps a pass's attention scores, which grow with the square of its tokens, bounded.
+    const auto tokens = static_cast<int64_t>(request->prompt.size());
+    if (!pass.empty() && (!options_.batch_prefill || pass_tokens >= options_.prefill_budget_tokens)) {
+      prefill(pass);
+      pass.clear();
+      pass_tokens = 0;
     }
+    pass.push_back(std::move(request));
+    pass_tokens += tokens;
+    admitted_tokens += tokens;
+  }
+  if (!pass.empty()) prefill(pass);
+}
 
-    // A one-token request, or one cancelled during prefill, is already done.
+void Scheduler::prefill(const std::vector<std::shared_ptr<Request>>& requests) {
+  const auto first_slot = static_cast<int64_t>(active_.size());
+  const auto start = SchedClock::now();
+  std::vector<int64_t> first_tokens(requests.size());
+  if (requests.size() == 1) {
+    // One prompt needs no packing; this is also exactly the path a solo run takes.
+    const auto ids = torch::tensor(requests[0]->prompt, torch::kInt64).unsqueeze(0);
+    first_tokens[0] = model_.prefill(ids, first_slot, cache_)[0].argmax(-1).item<int64_t>();
+  } else {
+    std::vector<std::vector<int64_t>> prompts;
+    prompts.reserve(requests.size());
+    for (const auto& request : requests) prompts.push_back(request->prompt);
+    // One device -> host copy for every first token in the pass.
+    const auto next = model_.prefill_packed(prompts, first_slot, cache_).argmax(-1).to(torch::kCPU, torch::kInt64);
+    const auto acc = next.accessor<int64_t, 1>();
+    for (size_t i = 0; i < requests.size(); ++i) first_tokens[i] = acc[static_cast<int64_t>(i)];
+  }
+  const auto done = SchedClock::now();
+
+  uint64_t tokens = 0;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const auto& request = requests[i];
+    request->slot = first_slot + static_cast<int64_t>(i);
+    request->t_prefill_start = start;
+    request->position = static_cast<int64_t>(request->prompt.size());
+    request->next_token = first_tokens[i];
+    request->generated.push_back(first_tokens[i]);
+    request->t_first_token = done;
+    request->out->push(first_tokens[i]);
+    tokens += request->prompt.size();
+    active_.push_back(request);
+  }
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    stats_.admitted += requests.size();
+    stats_.generated_tokens += requests.size();
+    stats_.prefill_ms += ms_since(start, done);
+    stats_.prefill_tokens += tokens;
+    ++stats_.prefill_passes;
+    stats_.max_batch = std::max<int64_t>(stats_.max_batch, static_cast<int64_t>(active_.size()));
+    stats_.active = static_cast<int64_t>(active_.size());
+    stats_.queued = queue_.size();
+  }
+
+  // A one-token request, or one cancelled during prefill, is already done. Walk backwards so
+  // compaction only ever moves a request that has already been checked.
+  for (size_t i = active_.size(); i-- > static_cast<size_t>(first_slot);) {
+    const auto& request = active_[i];
     const auto eos = request->options.eos_token_id >= 0 ? request->options.eos_token_id
                                                         : model_.config().eos_token_id;
     if (request->is_cancelled()) {
-      finish(active_.size() - 1, FinishReason::Cancelled);
-    } else if (request->options.stop_on_eos && first == eos) {
-      finish(active_.size() - 1, FinishReason::EosToken);
+      finish(i, FinishReason::Cancelled);
+    } else if (request->options.stop_on_eos && request->next_token == eos) {
+      finish(i, FinishReason::EosToken);
     } else if (static_cast<int64_t>(request->generated.size()) >= request->options.max_new_tokens) {
-      finish(active_.size() - 1, FinishReason::MaxTokens);
+      finish(i, FinishReason::MaxTokens);
     }
   }
 }
