@@ -57,9 +57,9 @@ struct Attention {
   torch::Tensor forward_prefill(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer, int64_t slot,
                                 int64_t start_pos, KVCache& cache) const;
 
-  // Padded prefill for slots 0..B-1 (static batching).
+  // Padded prefill for slots first_slot..first_slot+B-1.
   torch::Tensor forward_prefill_batch(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
-                                      int64_t start_pos, KVCache& cache) const;
+                                      int64_t start_pos, KVCache& cache, int64_t first_slot = 0) const;
 
   // Packed prefill: x [1, N, D] holds several sequences end to end; token i's key/value goes to
   // cache slot slots[i] at position positions[i]. allowed comes from build_packed_mask.
@@ -95,7 +95,7 @@ struct Block {
   torch::Tensor forward_prefill(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer, int64_t slot,
                                 int64_t start_pos, KVCache& cache) const;
   torch::Tensor forward_prefill_batch(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
-                                      int64_t start_pos, KVCache& cache) const;
+                                      int64_t start_pos, KVCache& cache, int64_t first_slot = 0) const;
   torch::Tensor forward_prefill_packed(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
                                        const torch::Tensor& slots, const torch::Tensor& positions,
                                        KVCache& cache) const;

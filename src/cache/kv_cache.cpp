@@ -38,15 +38,16 @@ void KVCache::write_prefill(int64_t layer, int64_t slot, int64_t start_pos, cons
 }
 
 void KVCache::write_prefill_batch(int64_t layer, int64_t batch, int64_t start_pos, const torch::Tensor& k,
-                                  const torch::Tensor& v) {
+                                  const torch::Tensor& v, int64_t first_slot) {
   const int64_t T = k.size(2);
   check(layer, batch, start_pos + T);
-  TORCH_CHECK(batch > 0 && batch <= n_slots_, "batch ", batch, " exceeds slots ", n_slots_);
+  TORCH_CHECK(batch > 0 && first_slot >= 0 && first_slot + batch <= n_slots_, "slots [", first_slot, ", ",
+              first_slot + batch, ") exceed ", n_slots_);
   TORCH_CHECK(k.sizes() == v.sizes(), "k and v must have the same shape");
   TORCH_CHECK(k.size(0) == batch && k.size(1) == n_head_ && k.size(3) == head_dim_, "unexpected k shape ", k.sizes());
 
-  k_[layer].slice(0, 0, batch).slice(2, start_pos, start_pos + T).copy_(k);
-  v_[layer].slice(0, 0, batch).slice(2, start_pos, start_pos + T).copy_(v);
+  k_[layer].slice(0, first_slot, first_slot + batch).slice(2, start_pos, start_pos + T).copy_(k);
+  v_[layer].slice(0, first_slot, first_slot + batch).slice(2, start_pos, start_pos + T).copy_(v);
 }
 
 void KVCache::write_packed(int64_t layer, const torch::Tensor& slots, const torch::Tensor& positions,

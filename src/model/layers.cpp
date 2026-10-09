@@ -87,9 +87,9 @@ torch::Tensor Attention::forward_prefill(const torch::Tensor& x, const torch::Te
 }
 
 torch::Tensor Attention::forward_prefill_batch(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
-                                               int64_t start_pos, KVCache& cache) const {
+                                               int64_t start_pos, KVCache& cache, int64_t first_slot) const {
   auto [q, k, v] = project(x);
-  cache.write_prefill_batch(layer, x.size(0), start_pos, k, v);
+  cache.write_prefill_batch(layer, x.size(0), start_pos, k, v, first_slot);
   return attend(q, k, v, allowed);
 }
 
@@ -125,8 +125,8 @@ torch::Tensor Block::forward_prefill(const torch::Tensor& x, const torch::Tensor
 }
 
 torch::Tensor Block::forward_prefill_batch(const torch::Tensor& x, const torch::Tensor& allowed, int64_t layer,
-                                           int64_t start_pos, KVCache& cache) const {
-  auto h = x + attn.forward_prefill_batch(ln_1(x), allowed, layer, start_pos, cache);
+                                           int64_t start_pos, KVCache& cache, int64_t first_slot) const {
+  auto h = x + attn.forward_prefill_batch(ln_1(x), allowed, layer, start_pos, cache, first_slot);
   return h + mlp.forward(ln_2(h));
 }
 

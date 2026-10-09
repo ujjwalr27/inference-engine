@@ -24,10 +24,11 @@ class KVCache {
   // Prefill: k, v are [1, H, T, head_dim] for one slot, written at positions [start_pos, start_pos + T).
   void write_prefill(int64_t layer, int64_t slot, int64_t start_pos, const torch::Tensor& k, const torch::Tensor& v);
 
-  // Padded prefill (static batching): k, v are [batch, H, T, head_dim] for slots 0..batch-1.
-  // Rows keep their padded layout, so padded columns occupy cache positions and must stay masked.
+  // Padded prefill: k, v are [batch, H, T, head_dim] for slots first_slot..first_slot+batch-1.
+  // Rows keep their padded layout, so padded columns occupy cache positions and must stay masked
+  // (static batching), or lie past the prompt where decode overwrites them (right padding).
   void write_prefill_batch(int64_t layer, int64_t batch, int64_t start_pos, const torch::Tensor& k,
-                           const torch::Tensor& v);
+                           const torch::Tensor& v, int64_t first_slot = 0);
 
   // Packed prefill: k, v are [1, H, N, head_dim] for N tokens from several sequences laid end to
   // end. Token i is written to slot slots[i] at position positions[i] (both [N] int64, on the

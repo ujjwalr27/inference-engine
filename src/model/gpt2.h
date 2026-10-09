@@ -47,6 +47,12 @@ class GPT2Model {
   torch::Tensor prefill_packed(const std::vector<std::vector<int64_t>>& prompts, int64_t first_slot,
                                KVCache& cache) const;
 
+  // The same, with the prompts right-padded into a [n, longest] batch instead of packed into one
+  // row. Packing does no work on padding but computes attention over the whole row, so its
+  // attention grows with the square of the total; padding's grows with n x longest^2.
+  torch::Tensor prefill_padded(const std::vector<std::vector<int64_t>>& prompts, int64_t first_slot,
+                               KVCache& cache) const;
+
   // Padded prefill for static batching: ids/positions/padding_mask are [B, T] (left padded,
   // see scheduler/padding.h) and fill slots 0..B-1 keeping the padded layout.
   // Returns logits at the last column, [B, vocab] - valid for every row because padding is on the left.

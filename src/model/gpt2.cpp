@@ -1,5 +1,6 @@
 #include "model/gpt2.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace gpt2 {
@@ -143,6 +144,46 @@ torch::Tensor GPT2Model::prefill_packed(const std::vector<std::vector<int64_t>>&
   }
   x = ln_f_(x.index_select(1, on_device(last)));  // [1, n, D]: only each prompt's last token
   return torch::linear(x, wte_).squeeze(0);
+}
+
+torch::Tensor GPT2Model::prefill_padded(const std::vector<std::vector<int64_t>>& prompts, int64_t first_slot,
+                                        KVCache& cache) const {
+  const auto n = static_cast<int64_t>(prompts.size());
+  TORCH_CHECK(n >= 1, "prefill_padded needs at least one prompt");
+  TORCH_CHECK(first_slot >= 0 && first_slot + n <= cache.n_slots(), "slots [", first_slot, ", ", first_slot + n,
+              ") outside the cache's ", cache.n_slots());
+  int64_t longest = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    const auto& prompt = prompts[static_cast<size_t>(i)];
+    const auto T = static_cast<int64_t>(prompt.size());
+    TORCH_CHECK(T >= 1 && T <= cfg_.n_ctx, "prompt ", i, " has ", T, " tokens, outside [1, ", cfg_.n_ctx, "]");
+    for (int64_t id : prompt) TORCH_CHECK(id >= 0 && id < cfg_.vocab_size, "token id out of range in prompt ", i);
+    longest = std::max(longest, T);
+  }
+
+  // Right padding: every prompt starts at column 0 = position 0, so the plain causal mask is
+  // enough (a real token never sees the padding after it) and each slot ends up laid out exactly
+  // as a solo prefill leaves it. Padding writes keys/values past each prompt's end; decode
+  // overwrites position p before any row attends to it, so they are never read.
+  auto ids = torch::zeros({n, longest}, torch::kInt64);
+  std::vector<int64_t> last(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    const auto& prompt = prompts[static_cast<size_t>(i)];
+    std::copy(prompt.begin(), prompt.end(), ids[i].data_ptr<int64_t>());
+    last[static_cast<size_t>(i)] = static_cast<int64_t>(prompt.size()) - 1;
+  }
+
+  torch::InferenceMode guard;
+  const auto options = torch::TensorOptions().dtype(torch::kInt64).device(device_);
+  const auto positions = torch::arange(longest, options);
+  auto x = torch::embedding(wte_, ids.to(device_)) + torch::embedding(wpe_, positions).unsqueeze(0);
+  const auto allowed = build_attention_mask(longest, {}, device_);
+  for (int64_t layer = 0; layer < cfg_.n_layer; ++layer) {
+    x = blocks_[static_cast<size_t>(layer)].forward_prefill_batch(x, allowed, layer, /*start_pos=*/0, cache,
+                                                                  first_slot);
+  }
+  x = x.index({torch::arange(n, options), torch::tensor(last, torch::kInt64).to(device_)});  // [n, D]
+  return torch::linear(ln_f_(x), wte_);
 }
 
 torch::Tensor GPT2Model::prefill_batch(const torch::Tensor& ids, const torch::Tensor& positions,

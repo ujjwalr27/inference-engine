@@ -94,32 +94,40 @@ TEST_F(Batching, PaddedPrefillLogitsMatchPerPrompt) {
   }
 }
 
-// The scheduler's batched prefill: prompts packed end to end in one row, each into its own slot
-// starting at slot 1, must give the same logits and the same cached keys/values as one by one.
-TEST_F(Batching, PackedPrefillMatchesPerPrompt) {
+// Batched prefill, both layouts: prompts right-padded into one batch (what the scheduler uses)
+// or packed end to end in one row. Each prompt goes into its own slot starting at slot 1, and
+// must give the same logits and the same cached keys/values as a prefill on its own.
+TEST_F(Batching, BatchedPrefillMatchesPerPrompt) {
   const auto prompts = mixed_prompts();
   const auto n = static_cast<int64_t>(prompts.size());
-  gpt2::KVCache cache(model_->config(), n + 1, model_->device(), model_->dtype());
-  const auto packed = model_->prefill_packed(prompts, /*first_slot=*/1, cache);
-  ASSERT_EQ(packed.sizes(), (std::vector<int64_t>{n, model_->config().vocab_size}));
+  for (bool padded : {true, false}) {
+    SCOPED_TRACE(padded ? "right-padded" : "packed");
+    auto run = [&](const std::vector<std::vector<int64_t>>& p, int64_t first_slot, gpt2::KVCache& c) {
+      return padded ? model_->prefill_padded(p, first_slot, c) : model_->prefill_packed(p, first_slot, c);
+    };
+    gpt2::KVCache cache(model_->config(), n + 1, model_->device(), model_->dtype());
+    const auto batched = run(prompts, /*first_slot=*/1, cache);
+    ASSERT_EQ(batched.sizes(), (std::vector<int64_t>{n, model_->config().vocab_size}));
 
-  for (int64_t i = 0; i < n; ++i) {
-    const auto& prompt = prompts[static_cast<size_t>(i)];
-    const auto T = static_cast<int64_t>(prompt.size());
-    gpt2::KVCache single_cache(model_->config(), 1, model_->device(), model_->dtype());
-    const auto single = model_->prefill(torch::tensor(prompt, torch::kInt64).unsqueeze(0), 0, single_cache);
-    SCOPED_TRACE("prompt " + std::to_string(i) + " (" + std::to_string(T) + " tokens)");
-    EXPECT_TRUE(AllClose(packed[i], single[0], kRtol, kAtol));
-    for (int64_t layer : {int64_t{0}, model_->config().n_layer - 1}) {
-      EXPECT_TRUE(AllClose(cache.keys(layer, n + 1, T)[i + 1], single_cache.keys(layer, 1, T)[0], kRtol, kAtol));
-      EXPECT_TRUE(AllClose(cache.values(layer, n + 1, T)[i + 1], single_cache.values(layer, 1, T)[0], kRtol, kAtol));
+    for (int64_t i = 0; i < n; ++i) {
+      const auto& prompt = prompts[static_cast<size_t>(i)];
+      const auto T = static_cast<int64_t>(prompt.size());
+      gpt2::KVCache single_cache(model_->config(), 1, model_->device(), model_->dtype());
+      const auto single = model_->prefill(torch::tensor(prompt, torch::kInt64).unsqueeze(0), 0, single_cache);
+      SCOPED_TRACE("prompt " + std::to_string(i) + " (" + std::to_string(T) + " tokens)");
+      EXPECT_TRUE(AllClose(batched[i], single[0], kRtol, kAtol));
+      for (int64_t layer : {int64_t{0}, model_->config().n_layer - 1}) {
+        EXPECT_TRUE(AllClose(cache.keys(layer, n + 1, T)[i + 1], single_cache.keys(layer, 1, T)[0], kRtol, kAtol));
+        EXPECT_TRUE(
+            AllClose(cache.values(layer, n + 1, T)[i + 1], single_cache.values(layer, 1, T)[0], kRtol, kAtol));
+      }
     }
-  }
-  EXPECT_TRUE(cache.keys(0, 1, model_->config().n_ctx).eq(0).all().item<bool>()) << "slot 0 was not in the pass";
+    EXPECT_TRUE(cache.keys(0, 1, model_->config().n_ctx).eq(0).all().item<bool>()) << "slot 0 was not in the pass";
 
-  EXPECT_THROW(model_->prefill_packed({}, 0, cache), c10::Error);
-  EXPECT_THROW(model_->prefill_packed(prompts, /*first_slot=*/2, cache), c10::Error);  // runs past the slots
-  EXPECT_THROW(model_->prefill_packed({{1, 2}, {}}, 0, cache), c10::Error);
+    EXPECT_THROW(run({}, 0, cache), c10::Error);
+    EXPECT_THROW(run(prompts, /*first_slot=*/2, cache), c10::Error);  // runs past the slots
+    EXPECT_THROW(run({{1, 2}, {}}, 0, cache), c10::Error);
+  }
 }
 
 // The Phase 3 headline test: same prompts, alone vs batched together, same text.
