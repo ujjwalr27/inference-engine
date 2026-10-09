@@ -34,8 +34,9 @@ class SafeTensorsTest : public ::testing::Test {
 
   static std::vector<char> bytes_of(const std::vector<float>& f, const std::vector<int64_t>& i) {
     std::vector<char> out(f.size() * sizeof(float) + i.size() * sizeof(int64_t));
-    std::memcpy(out.data(), f.data(), f.size() * sizeof(float));
-    std::memcpy(out.data() + f.size() * sizeof(float), i.data(), i.size() * sizeof(int64_t));
+    // An empty vector's data() may be null, and memcpy from null is undefined even for 0 bytes.
+    if (!f.empty()) std::memcpy(out.data(), f.data(), f.size() * sizeof(float));
+    if (!i.empty()) std::memcpy(out.data() + f.size() * sizeof(float), i.data(), i.size() * sizeof(int64_t));
     return out;
   }
 
