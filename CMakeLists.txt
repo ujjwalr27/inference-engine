@@ -55,10 +55,25 @@ FetchContent_Declare(cpp_httplib
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(cpp_httplib)
 
-# Hugging Face tokenizers via mlc-ai/tokenizers-cpp (builds the Rust crate with cargo).
-# SentencePiece is not needed for GPT-2's byte-level BPE, so it stays off.
-set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/tokenizers-cpp tokenizers EXCLUDE_FROM_ALL)
+# Hugging Face tokenizers via mlc-ai/tokenizers-cpp: its Rust crate, built with cargo, and the one
+# C++ file that wraps it. The submodule's own CMakeLists always compiles SentencePiece, with its
+# bundled Abseil and protobuf-lite, even with the SentencePiece tokenizer switched off. GPT-2's
+# byte-level BPE needs none of it, so only the two pieces above are built here.
+set(TOKENIZERS_CPP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tokenizers-cpp)
+find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{CARGO_HOME}/bin" "$ENV{HOME}/.cargo/bin" REQUIRED)
+set(TOKENIZERS_RUST_DIR ${CMAKE_CURRENT_BINARY_DIR}/tokenizers-rust)
+set(TOKENIZERS_RUST_LIB ${TOKENIZERS_RUST_DIR}/release/libtokenizers_c.a)
+add_custom_command(
+  OUTPUT ${TOKENIZERS_RUST_LIB}
+  COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${TOKENIZERS_RUST_DIR} ${CARGO_EXECUTABLE} build --release
+  WORKING_DIRECTORY ${TOKENIZERS_CPP_DIR}/rust
+  COMMENT "Building the Hugging Face tokenizers crate"
+  VERBATIM)
+add_custom_target(tokenizers_rust DEPENDS ${TOKENIZERS_RUST_LIB})
+add_library(tokenizers_cpp STATIC ${TOKENIZERS_CPP_DIR}/src/huggingface_tokenizer.cc)
+add_dependencies(tokenizers_cpp tokenizers_rust)
+target_include_directories(tokenizers_cpp PUBLIC ${TOKENIZERS_CPP_DIR}/include)
+target_link_libraries(tokenizers_cpp PUBLIC ${TOKENIZERS_RUST_LIB} ${CMAKE_DL_LIBS} Threads::Threads)
 
 # Core library (grows each phase)
 add_library(gpt2_core
