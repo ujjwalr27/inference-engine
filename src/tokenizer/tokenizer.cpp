@@ -25,6 +25,9 @@ struct Tokenizer::Impl {
   // tokenizers-cpp's Decode writes into a buffer held by the handle and then reads it back, so two
   // threads decoding at once could read each other's text. Held only for one call (microseconds).
   std::mutex mutex;
+  // Read once: the bundled tokenizers 0.21 answers get_vocab_size(true) by building the whole
+  // 50k-entry vocabulary map, ~8 ms a call. A test calling it per token took 417 s on the T4.
+  size_t vocab_size = 0;
 };
 
 Tokenizer Tokenizer::from_blob(const std::string& tokenizer_json) {
@@ -32,6 +35,7 @@ Tokenizer Tokenizer::from_blob(const std::string& tokenizer_json) {
   t.impl_ = std::make_shared<Impl>();
   t.impl_->tok = tokenizers::Tokenizer::FromBlobJSON(tokenizer_json);
   if (!t.impl_->tok) throw std::runtime_error("failed to parse tokenizer.json");
+  t.impl_->vocab_size = t.impl_->tok->GetVocabSize();
   return t;
 }
 
@@ -60,10 +64,7 @@ std::string Tokenizer::decode(const std::vector<int64_t>& ids) const {
   return impl_->tok->Decode(narrow);
 }
 
-size_t Tokenizer::vocab_size() const {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  return impl_->tok->GetVocabSize();
-}
+size_t Tokenizer::vocab_size() const { return impl_->vocab_size; }
 
 // Byte-level BPE decodes each token to its own bytes and the text is those bytes concatenated,
 // so decoding can restart at any character boundary. Everything up to pending_start_ has been

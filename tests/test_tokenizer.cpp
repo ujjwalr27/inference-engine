@@ -93,14 +93,15 @@ TEST_F(TokenizerTest, IncrementalDecodeHoldsBackThenReleases) {
 // tokens that are partial characters on their own (lone UTF-8 bytes) are the hardest case for
 // that: the streamed text must still equal decoding everything at once.
 TEST_F(TokenizerTest, IncrementalDecodeMatchesFullDecodeOnRandomStreams) {
+  const auto vocab = static_cast<int64_t>(tok_->vocab_size());
   std::vector<int64_t> partial;  // tokens that decode to an incomplete character by themselves
-  for (int64_t id = 0; id < static_cast<int64_t>(tok_->vocab_size()); ++id) {
+  for (int64_t id = 0; id < vocab; ++id) {
     if (tok_->decode({id}).find("\xEF\xBF\xBD") != std::string::npos) partial.push_back(id);
   }
   ASSERT_GT(partial.size(), 100u);
 
   std::mt19937 rng(7);
-  std::uniform_int_distribution<int64_t> any(0, static_cast<int64_t>(tok_->vocab_size()) - 1);
+  std::uniform_int_distribution<int64_t> any(0, vocab - 1);
   std::uniform_int_distribution<size_t> pick(0, partial.size() - 1);
   std::uniform_int_distribution<int> length(1, 60);
   for (int n = 0; n < 300; ++n) {
