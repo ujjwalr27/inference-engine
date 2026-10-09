@@ -88,7 +88,8 @@ int main(int argc, char** argv) {
                       ? "on, length step " + std::to_string(scheduler_options.graph_length_step)
                       : std::string("off"))
               << "\n"
-              << "POST /v1/generate  {\"prompt\": \"...\", \"max_tokens\": 64, \"stream\": true}\n";
+              << "POST /v1/generate  {\"prompt\": \"...\", \"max_tokens\": 64, \"stream\": true}\n"
+              << std::flush;  // stdout is block-buffered under docker or a log file, not line-buffered
 
     if (server_options.port != 0 && !server.listen()) {
       std::cerr << "error: could not bind " << server_options.host << ":" << port << "\n";
