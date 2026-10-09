@@ -2,12 +2,16 @@
 // ones have finished (a closed-loop client would hide queueing delay - "coordinated omission").
 //
 // Usage: gpt2_loadgen [--url http://127.0.0.1:8080] [--rate 4] [--duration 30]
-//                     [--prompt-min 16] [--prompt-max 128] [--max-tokens 32]
+//                     [--prompt-min 16] [--prompt-max 128] [--max-tokens 32] [--max-tokens-min N]
 //                     [--stream on|off] [--out results/run.csv] [--seed 1]
 //                     [--api engine|openai] [--model gpt2]
 //
 // --api openai drives an OpenAI-compatible /v1/completions server (vLLM) with the same token-id
 // prompts, so the same load can be compared across servers.
+//
+// --max-tokens-min N gives each request its own output length, drawn uniformly from
+// [N, --max-tokens]. With every request the same length, a static batch finishes all at once and
+// never idles a slot; mixed lengths show what static batching really costs.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -56,6 +60,7 @@ struct Options {
   double rate = 4.0;
   double duration = 30.0;
   int64_t prompt_min = 16, prompt_max = 128, max_tokens = 32;
+  int64_t max_tokens_min = 0;  // > 0: output lengths drawn from [max_tokens_min, max_tokens]
   bool stream = true;
   std::string out;
   uint32_t seed = 1;
@@ -72,13 +77,14 @@ std::vector<int64_t> random_prompt(std::mt19937& rng, int64_t min_len, int64_t m
   return prompt;
 }
 
-// Every request generates exactly max_tokens on every server, so they all do the same work.
-json request_body(const Options& options, const std::vector<int64_t>& prompt) {
+// Every request generates exactly max_tokens on every server (EOS is ignored), so every server
+// does the same work for the same seed.
+json request_body(const Options& options, const std::vector<int64_t>& prompt, int64_t max_tokens) {
   if (!options.openai) {
-    return json{{"token_ids", prompt}, {"max_tokens", options.max_tokens}, {"stream", options.stream},
+    return json{{"token_ids", prompt}, {"max_tokens", max_tokens}, {"stream", options.stream},
                 {"stop_on_eos", false}};
   }
-  json body{{"model", options.model}, {"prompt", prompt}, {"max_tokens", options.max_tokens},
+  json body{{"model", options.model}, {"prompt", prompt}, {"max_tokens", max_tokens},
             {"temperature", 0}, {"ignore_eos", true}, {"stream", options.stream}};
   if (options.stream) body["stream_options"] = {{"include_usage", true}};  // exact token count at the end
   return body;
@@ -116,12 +122,13 @@ void send_openai_stream(httplib::Client& client, const json& body, Record& recor
   record.status = result ? result->status : 0;
 }
 
-void send_one(const Options& options, Record& record, std::vector<int64_t> prompt, Clock::time_point run_start) {
+void send_one(const Options& options, Record& record, std::vector<int64_t> prompt, int64_t max_tokens,
+              Clock::time_point run_start) {
   httplib::Client client(options.url);
   client.set_read_timeout(300, 0);
   client.set_write_timeout(30, 0);
 
-  const json body = request_body(options, prompt);
+  const json body = request_body(options, prompt, max_tokens);
   record.prompt_tokens = static_cast<int64_t>(prompt.size());
   const auto sent = Clock::now();
   record.send_ms = ms_between(run_start, sent);
@@ -241,6 +248,7 @@ int main(int argc, char** argv) {
       else if (arg == "--prompt-min") options.prompt_min = std::stoll(next());
       else if (arg == "--prompt-max") options.prompt_max = std::stoll(next());
       else if (arg == "--max-tokens") options.max_tokens = std::stoll(next());
+      else if (arg == "--max-tokens-min") options.max_tokens_min = std::stoll(next());
       else if (arg == "--stream") options.stream = (next() == "on");
       else if (arg == "--out") options.out = next();
       else if (arg == "--seed") options.seed = static_cast<uint32_t>(std::stoul(next()));
@@ -260,6 +268,12 @@ int main(int argc, char** argv) {
     std::cerr << "error: --rate and --duration must be positive\n";
     return 2;
   }
+  if (options.max_tokens_min < 0 || options.max_tokens_min > options.max_tokens) {
+    std::cerr << "error: --max-tokens-min must be between 0 and --max-tokens\n";
+    return 2;
+  }
+  std::uniform_int_distribution<int64_t> output_length(std::max<int64_t>(options.max_tokens_min, 1),
+                                                       options.max_tokens);
 
   std::mt19937 rng(options.seed);
   std::exponential_distribution<double> gap(options.rate);  // Poisson arrivals
@@ -272,7 +286,9 @@ int main(int argc, char** argv) {
                                         std::chrono::duration<double>(options.duration));
 
   std::cout << "open-loop load: " << options.rate << " req/s for " << options.duration << " s -> " << options.url
-            << " (stream " << (options.stream ? "on" : "off") << (options.openai ? ", OpenAI API" : "") << ")\n";
+            << " (stream " << (options.stream ? "on" : "off") << (options.openai ? ", OpenAI API" : "") << ", "
+            << (options.max_tokens_min > 0 ? std::to_string(options.max_tokens_min) + "-" : std::string())
+            << options.max_tokens << " output tokens)\n";
 
   uint64_t id = 0;
   auto next_arrival = run_start;
@@ -284,9 +300,11 @@ int main(int argc, char** argv) {
     Record* raw = record.get();
     owned.push_back(std::move(record));
     auto prompt = random_prompt(rng, options.prompt_min, options.prompt_max);
+    // Drawn only when asked for, so a run without --max-tokens-min replays the same prompts as before.
+    const int64_t max_tokens = options.max_tokens_min > 0 ? output_length(rng) : options.max_tokens;
     // Fire on schedule whether or not earlier requests have come back.
-    in_flight.emplace_back([&options, raw, prompt = std::move(prompt), run_start]() mutable {
-      send_one(options, *raw, std::move(prompt), run_start);
+    in_flight.emplace_back([&options, raw, prompt = std::move(prompt), max_tokens, run_start]() mutable {
+      send_one(options, *raw, std::move(prompt), max_tokens, run_start);
     });
     next_arrival += std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(gap(rng)));
   }
