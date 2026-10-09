@@ -58,6 +58,23 @@ TEST_F(Cache, DecodeWritesPerRowPositions) {
   EXPECT_TRUE(keys.index({0, torch::indexing::Slice(), 3}).eq(0).all().item<bool>());
 }
 
+// Two sequences packed into one row: 2 tokens for slot 1, then 3 tokens for slot 0.
+TEST_F(Cache, PackedWriteScattersTokensToTheirSlots) {
+  gpt2::KVCache cache(cfg_, 2, torch::kCPU, torch::kFloat32);
+  const auto k = torch::randn({1, 2, 5, 4});
+  const auto v = torch::randn({1, 2, 5, 4});
+  const auto slots = torch::tensor({1, 1, 0, 0, 0}, torch::kInt64);
+  const auto positions = torch::tensor({0, 1, 0, 1, 2}, torch::kInt64);
+  cache.write_packed(/*layer=*/1, slots, positions, k, v);
+
+  EXPECT_TRUE(torch::equal(cache.keys(1, 2, 2)[1], k[0].slice(1, 0, 2)));
+  EXPECT_TRUE(torch::equal(cache.keys(1, 1, 3)[0], k[0].slice(1, 2, 5)));
+  EXPECT_TRUE(torch::equal(cache.values(1, 1, 3)[0], v[0].slice(1, 2, 5)));
+  EXPECT_TRUE(cache.keys(1, 2, 6)[1].slice(1, 2, 6).eq(0).all().item<bool>()) << "slot 1 has only 2 tokens";
+  EXPECT_TRUE(cache.keys(0, 2, 6).eq(0).all().item<bool>()) << "other layers must stay untouched";
+  EXPECT_THROW(cache.write_packed(1, slots.slice(0, 0, 4), positions, k, v), c10::Error);  // length mismatch
+}
+
 TEST_F(Cache, ViewsAreNotCopies) {
   gpt2::KVCache cache(cfg_, 1, torch::kCPU, torch::kFloat32);
   auto view = cache.keys(0, 1, 6);

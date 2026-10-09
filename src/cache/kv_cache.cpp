@@ -49,6 +49,21 @@ void KVCache::write_prefill_batch(int64_t layer, int64_t batch, int64_t start_po
   v_[layer].slice(0, 0, batch).slice(2, start_pos, start_pos + T).copy_(v);
 }
 
+void KVCache::write_packed(int64_t layer, const torch::Tensor& slots, const torch::Tensor& positions,
+                           const torch::Tensor& k, const torch::Tensor& v) {
+  check(layer, 0, 0);
+  TORCH_CHECK(k.sizes() == v.sizes(), "k and v must have the same shape");
+  TORCH_CHECK(k.dim() == 4 && k.size(0) == 1 && k.size(1) == n_head_ && k.size(3) == head_dim_,
+              "unexpected k shape ", k.sizes());
+  const int64_t n = k.size(2);
+  TORCH_CHECK(slots.dim() == 1 && slots.size(0) == n && positions.sizes() == slots.sizes(),
+              "slots and positions must be [N] with N = ", n);
+
+  // As in write_decode, the two index tensors put the token dim first: [N, H, head_dim].
+  k_[layer].index_put_({slots, Slice(), positions}, k[0].transpose(0, 1));
+  v_[layer].index_put_({slots, Slice(), positions}, v[0].transpose(0, 1));
+}
+
 void KVCache::write_decode(int64_t layer, int64_t batch, const torch::Tensor& cache_index, const torch::Tensor& k,
                            const torch::Tensor& v) {
   check(layer, batch, 0);

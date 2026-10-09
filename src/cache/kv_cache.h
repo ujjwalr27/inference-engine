@@ -29,6 +29,12 @@ class KVCache {
   void write_prefill_batch(int64_t layer, int64_t batch, int64_t start_pos, const torch::Tensor& k,
                            const torch::Tensor& v);
 
+  // Packed prefill: k, v are [1, H, N, head_dim] for N tokens from several sequences laid end to
+  // end. Token i is written to slot slots[i] at position positions[i] (both [N] int64, on the
+  // cache's device), so one copy covers every sequence in the pass.
+  void write_packed(int64_t layer, const torch::Tensor& slots, const torch::Tensor& positions, const torch::Tensor& k,
+                    const torch::Tensor& v);
+
   // Decode: k, v are [batch, H, 1, head_dim] for slots 0..batch-1, written at cache_index[batch] (int64).
   // cache_index is where the token lands in the cache, which equals its position id only when the
   // row has no padding in front of it (Phase 2/4); static batching passes a different index.
