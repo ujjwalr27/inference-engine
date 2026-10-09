@@ -189,7 +189,7 @@ TEST_F(SchedulerTest, StaggeredRequestsMatchTheirSoloRuns) {
 }
 
 // Requests already waiting when a step starts are prefilled together. Queue four before the
-// scheduler starts, so the first step admits all of them: one packed pass with the prefill on,
+// scheduler starts, so the first step admits all of them: one padded pass with the prefill on,
 // four passes with it off, and the same answers either way.
 TEST_F(SchedulerTest, WaitingRequestsArePrefilledInOnePass) {
   std::mt19937 rng(11);
@@ -235,8 +235,8 @@ TEST_F(SchedulerTest, WaitingRequestsArePrefilledInOnePass) {
   }
 }
 
-// A static batch is prefilled whole, without the per-step budget, but still in passes of about
-// the budget's size, so one pass's attention scores (quadratic in its tokens) stay bounded.
+// A static batch is prefilled whole, without the per-step budget, but still in passes of at most
+// the budget in padded tokens, so one pass's activations and attention scores stay bounded.
 TEST_F(SchedulerTest, StaticBatchPrefillIsSplitIntoBudgetSizedPasses) {
   std::vector<std::vector<int64_t>> prompts(4, std::vector<int64_t>(corpus_.begin(), corpus_.begin() + 10));
   gpt2::GenerationOptions gen;
@@ -245,7 +245,7 @@ TEST_F(SchedulerTest, StaticBatchPrefillIsSplitIntoBudgetSizedPasses) {
   gpt2::SchedulerOptions options;
   options.policy = gpt2::BatchingPolicy::Static;
   options.n_slots = 4;
-  options.prefill_budget_tokens = 16;  // two 10-token prompts reach it
+  options.prefill_budget_tokens = 20;  // two 10-token prompts fit, a third would not
   gpt2::Scheduler scheduler(*model_, options);
   std::vector<std::shared_ptr<gpt2::Request>> requests;
   for (const auto& p : prompts) requests.push_back(scheduler.submit(p, gen));
@@ -258,6 +258,30 @@ TEST_F(SchedulerTest, StaticBatchPrefillIsSplitIntoBudgetSizedPasses) {
   EXPECT_EQ(stats.batches, 1u);
   EXPECT_EQ(stats.prefill_passes, 2u);
   for (const auto& out : outputs) EXPECT_EQ(out, outputs[0]) << "identical prompts, identical answers";
+}
+
+// One long prompt among short ones gets its own pass instead of padding them all to its length.
+TEST_F(SchedulerTest, ALongPromptDoesNotPadShortOnesToItsLength) {
+  const std::vector<int64_t> short_prompt(corpus_.begin(), corpus_.begin() + 8);
+  const std::vector<int64_t> long_prompt(corpus_.begin(), corpus_.begin() + 200);
+  gpt2::GenerationOptions gen;
+  gen.max_new_tokens = 2;
+
+  gpt2::SchedulerOptions options;
+  options.n_slots = 4;
+  options.prefill_budget_tokens = 256;  // admits all four; 4 x 200 padded tokens would not fit one pass
+  gpt2::Scheduler scheduler(*model_, options);
+  std::vector<std::shared_ptr<gpt2::Request>> requests;
+  for (const auto* p : {&short_prompt, &short_prompt, &short_prompt, &long_prompt}) {
+    requests.push_back(scheduler.submit(*p, gen));
+  }
+  scheduler.start();
+  for (auto& r : requests) r->out->collect();
+  scheduler.stop();
+
+  const auto stats = scheduler.stats();
+  EXPECT_EQ(stats.admitted, 4u);
+  EXPECT_EQ(stats.prefill_passes, 2u) << "three short prompts together, the long one alone";
 }
 
 TEST_F(SchedulerTest, CancellationFreesTheSlotWithoutDisturbingOthers) {

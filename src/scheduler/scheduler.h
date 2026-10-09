@@ -36,8 +36,8 @@ struct SchedulerOptions {
   size_t max_queue = 64;              // waiting requests before new ones are rejected
   int64_t prefill_budget_tokens = 512;  // prompt tokens admitted per step; caps the decode pause
 
-  // Prefill the requests admitted in one step together, in packed passes of about
-  // prefill_budget_tokens each (GPT2Model::prefill_packed), instead of one pass per request.
+  // Prefill the requests admitted in one step together, as right-padded batches of at most
+  // prefill_budget_tokens padded tokens (GPT2Model::prefill_padded), instead of one pass each.
   bool batch_prefill = true;
   std::chrono::milliseconds idle_wait{20};
 

@@ -162,7 +162,7 @@ void Scheduler::admit() {
   size_t remaining = admission_limit(apply_budget);
   int64_t admitted_tokens = 0;
   std::vector<std::shared_ptr<Request>> pass;  // requests for the next prefill pass
-  int64_t pass_tokens = 0;
+  int64_t pass_longest = 0;
   while (remaining > 0 && (!apply_budget || admitted_tokens < options_.prefill_budget_tokens)) {
     auto request = queue_.try_pop();
     if (!request) break;
@@ -176,17 +176,21 @@ void Scheduler::admit() {
       continue;
     }
 
-    // A pass is closed once it reaches the budget, the same rule that ends admission, so with the
-    // budget applied everything admitted goes in one pass. Without it (a static batch), the cap
-    // keeps a pass's attention scores, which grow with the square of its tokens, bounded.
+    // A pass is one right-padded batch, [requests, longest prompt], and is closed before it would
+    // exceed the budget in padded tokens. Padding is real work and attention grows with the
+    // square of the length, so one long prompt must not drag a crowd of short ones up to its
+    // length; a prompt longer than the budget gets a pass to itself. Prompts of similar length,
+    // the common case, share one pass per step.
     const auto tokens = static_cast<int64_t>(request->prompt.size());
-    if (!pass.empty() && (!options_.batch_prefill || pass_tokens >= options_.prefill_budget_tokens)) {
+    const int64_t longest = std::max(pass_longest, tokens);
+    if (!pass.empty() && (!options_.batch_prefill ||
+                          static_cast<int64_t>(pass.size() + 1) * longest > options_.prefill_budget_tokens)) {
       prefill(pass);
       pass.clear();
-      pass_tokens = 0;
+      pass_longest = 0;
     }
     pass.push_back(std::move(request));
-    pass_tokens += tokens;
+    pass_longest = std::max(pass_longest, tokens);
     admitted_tokens += tokens;
   }
   if (!pass.empty()) prefill(pass);
@@ -197,7 +201,7 @@ void Scheduler::prefill(const std::vector<std::shared_ptr<Request>>& requests) {
   const auto start = SchedClock::now();
   std::vector<int64_t> first_tokens(requests.size());
   if (requests.size() == 1) {
-    // One prompt needs no packing; this is also exactly the path a solo run takes.
+    // One prompt needs no padding; this is also exactly the path a solo run takes.
     const auto ids = torch::tensor(requests[0]->prompt, torch::kInt64).unsqueeze(0);
     first_tokens[0] = model_.prefill(ids, first_slot, cache_)[0].argmax(-1).item<int64_t>();
   } else {
@@ -205,7 +209,7 @@ void Scheduler::prefill(const std::vector<std::shared_ptr<Request>>& requests) {
     prompts.reserve(requests.size());
     for (const auto& request : requests) prompts.push_back(request->prompt);
     // One device -> host copy for every first token in the pass.
-    const auto next = model_.prefill_packed(prompts, first_slot, cache_).argmax(-1).to(torch::kCPU, torch::kInt64);
+    const auto next = model_.prefill_padded(prompts, first_slot, cache_).argmax(-1).to(torch::kCPU, torch::kInt64);
     const auto acc = next.accessor<int64_t, 1>();
     for (size_t i = 0; i < requests.size(); ++i) first_tokens[i] = acc[static_cast<int64_t>(i)];
   }
