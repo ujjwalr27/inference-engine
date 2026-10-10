@@ -247,8 +247,10 @@ def chart_policy_varied(results: Path, out: Path, context: str) -> None:
         return
     lengths = pd.concat([load(cont), load(stat)])
     lengths = lengths[lengths["ok"]]["output_tokens"]
-    span = f"{lengths.min()}–{lengths.max()} output tokens"
-    chart_policy(cont, stat, out, context.replace("64 output tokens", span), f"With {span}")
+    # Described by mean and maximum: before 2026-10-10 the load generator undercounted ~1% of
+    # streamed requests, so the minimum in older CSVs is below what was requested.
+    span = f"mixed output lengths (mean {lengths.mean():.0f}, up to {lengths.max()} tokens)"
+    chart_policy(cont, stat, out, context.replace("64 output tokens", span), "With mixed output lengths")
 
 
 def chart_policy(cont_path: Path, stat_path: Path, out: Path, context: str, lead: str) -> None:
@@ -256,7 +258,7 @@ def chart_policy(cont_path: Path, stat_path: Path, out: Path, context: str, lead
         return
     cont = summary(cont_path)
     stat = summary(stat_path)
-    fig, (left, right) = plt.subplots(1, 2, figsize=(9, 4.2), gridspec_kw={"width_ratios": [2, 1]})
+    fig, (left, right) = plt.subplots(1, 2, figsize=(10, 4.2), gridspec_kw={"width_ratios": [2, 1]})
 
     metrics = [("ttft_p50", "p50"), ("ttft_p99", "p99")]
     width = 0.36
@@ -507,12 +509,16 @@ def chart_engine_vs_vllm(results: Path, out: Path, context: str) -> None:
     right.set_ylabel("milliseconds (log scale)")
     right.set_title("Time to first token (p50)")
 
-    low = rates[0]
+    low, top = rates[0], rates[-1]
     eager, ours, vllm = (points[key].loc[low, "tpot_p50"] for key in ("engine", best, "vllm"))
-    fig.suptitle(f"CUDA graphs cut the engine's time per token {eager / ours:.1f}x at {low:g} req/s: "
-                 f"{ours:.1f} ms against vLLM's {vllm:.1f} ms", x=0.01, ha="left", fontsize=12, fontweight="bold")
-    top = rates[-1]
     tps = {key: points[key].loc[top, "tokens_per_s"] for key, *_ in servers}
+    if full:
+        title = (f"At {top:g} req/s the engine serves {tps[best] / tps['vllm'] - 1:.0%} more tokens/s than vLLM; "
+                 f"at {low:g} req/s, {ours:.1f} vs {vllm:.1f} ms per token")
+    else:
+        title = (f"CUDA graphs cut the engine's time per token {eager / ours:.1f}x at {low:g} req/s: "
+                 f"{ours:.1f} ms against vLLM's {vllm:.1f} ms")
+    fig.suptitle(title, x=0.01, ha="left", fontsize=12, fontweight="bold")
     footnote(fig, context.replace(" · 32 slots", "") + " · at most 32 sequences in flight on both servers · "
              "vLLM 0.31 (Triton attention: FlashAttention needs a newer GPU)\n"
              f"Throughput at {top:g} req/s: {tps[best]:.0f} (engine at its best), {tps['vllm']:.0f} (vLLM), "
