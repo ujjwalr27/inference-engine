@@ -21,6 +21,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -122,6 +123,27 @@ void send_openai_stream(httplib::Client& client, const json& body, Record& recor
   record.status = result ? result->status : 0;
 }
 
+// Tokens in an engine stream. Counting "data:" events undercounts: the server holds back a token
+// that ends partway through a UTF-8 character and sends it with the next one, so one event can
+// carry two tokens (~1% of requests on random prompts). The final event's timings has the exact
+// count; events are only counted when a stream ends without it.
+int64_t streamed_token_count(const std::string& stream) {
+  int64_t events = 0;
+  size_t start = 0, end;
+  while ((end = stream.find("\n\n", start)) != std::string::npos) {
+    const std::string event = stream.substr(start, end - start);
+    start = end + 2;
+    if (event.rfind("data: {", 0) != 0) continue;
+    try {
+      const auto j = json::parse(event.substr(6));
+      if (j.contains("timings")) return j.at("timings").at("output_tokens").get<int64_t>();
+      if (j.contains("token_id")) ++events;
+    } catch (const std::exception&) {
+    }
+  }
+  return events;
+}
+
 void send_one(const Options& options, Record& record, std::vector<int64_t> prompt, int64_t max_tokens,
               Clock::time_point run_start) {
   httplib::Client client(options.url);
@@ -153,25 +175,19 @@ void send_one(const Options& options, Record& record, std::vector<int64_t> promp
 
   if (options.stream) {
     bool first_seen = false;
-    int64_t tokens = 0;
+    std::string stream;  // a few KB per request; parsed once the stream ends
     auto result = client.Post(
         "/v1/generate", httplib::Headers{}, body.dump(), "application/json",
         [&](const char* data, size_t len) {
-          const std::string chunk(data, len);
-          if (!first_seen && chunk.find("\"text\"") != std::string::npos) {
+          if (!first_seen && std::string_view(data, len).find("\"text\"") != std::string_view::npos) {
             record.ttft_ms = ms_between(sent, Clock::now());
             first_seen = true;
           }
-          // Each token arrives as its own "data: {...}" event; [DONE] closes the stream.
-          size_t pos = 0;
-          while ((pos = chunk.find("\"token_id\"", pos)) != std::string::npos) {
-            ++tokens;
-            ++pos;
-          }
+          stream.append(data, len);
           return true;
         });
     record.done_ms = ms_between(sent, Clock::now());
-    record.output_tokens = tokens;
+    record.output_tokens = streamed_token_count(stream);
     record.status = result ? result->status : 0;
   } else {
     auto result = client.Post("/v1/generate", body.dump(), "application/json");
