@@ -244,12 +244,19 @@ capacity ~50 req/s (~3200 tok/s), continuous batching -95% first-token latency v
 - [x] Re-run the full sweep: served throughput 730 -> 3239 tok/s; overload now answers 429, no dropped connections
 - [x] Commit CSVs + PNGs to `results/2026-10-05_t4/`, with an engine-vs-Hugging-Face chart; chart titles computed from the data
 - [x] Load generator: `--max-tokens-min` for mixed output lengths; `kaggle_sweep.py` section 5 compares the
-      policies with 8-128 output tokens (to run on Kaggle)
+      policies with 8-128 output tokens. At 16 req/s: first token 8 vs 202 ms, same throughput (2026-10-09)
+- [ ] Mixed output lengths at 64 req/s: with uniform lengths static batching won past capacity (4,152 vs
+      3,904 tok/s), and idle slots under mixed lengths are what should turn that around
+- [ ] Continuous batching past capacity: coalesce admissions (wait for a few free slots or a few ms) so prefill
+      passes are larger and decode is interrupted less; measure against static at 64 req/s
+- [x] Load generator counted tokens per streamed event, ~1% low for the engine (an event can carry two tokens
+      when a UTF-8 character spans them); now reads the final event's exact count
 - [x] Time prefill and decode inside the scheduler (`/stats`): bookkeeping is negligible; prefill is ~34% of a
       saturated run once decode uses CUDA graphs
 - [ ] Prefill budget vs TTFT/TPOT trade-off (bonus)
 - [x] vLLM baseline (0.31, own venv, T4 via Triton attention): the engine with CUDA graphs matches it on this
-      workload (TPOT 2-10% lower, first token 2.7-3.5x sooner, +5% throughput past capacity)
+      workload (TPOT 2-10% lower, first token 2.7-3.5x sooner, +5% throughput past capacity); with batched
+      prefill it is ahead (2026-10-09: TPOT 10-18% lower, +18% throughput past capacity)
 - [ ] GPT-2 medium run (bonus, config-driven)
 
 **Done when:** 4–5 clean, labelled charts.
@@ -261,13 +268,15 @@ capacity ~50 req/s (~3200 tok/s), continuous batching -95% first-token latency v
 - [x] CUDA graphs: bucket `B` and `T_eff`, capture decode per bucket, measure overhead cut
       (decode step 4.8 -> 2.2 ms at batch 1; served TPOT 6.0 -> 2.5 ms; capacity +12%)
 - [x] Finer length buckets: 64 by default (`--graph-length-step`), for batch 32 with a 512-token cache, which was
-      slower with graphs (7.3 vs 6.3 ms) because 513 padded to 640. To measure on Kaggle (`bench_fp16_graphs*.csv`)
+      slower with graphs (7.3 vs 6.3 ms) because 513 padded to 640. Measured: 2-12% faster than 128 everywhere,
+      but that corner is still slower than eager (7.1 vs 6.4 ms: it is attention-bound)
+- [ ] Use eager decode where graphs lose (batch x length large and attention-bound), or finer buckets there
 - [x] Batch the prefills admitted in one step: one right-padded batch, one read-back (`--solo-prefill` turns it
       off). Packing prompts into one row was tried first and lost on CPU (quadratic attention over the row:
-      2.3x slower than one pass each at 16 prompts, padded 1.05x faster). Matches per-prompt prefill on CPU;
-      to measure on Kaggle (`engine_full`, `prefill_*` bench rows)
-- [x] CUDA graphs are the default for `gpt2_serve` on CUDA (`--no-cuda-graphs` to turn off). The next Kaggle run
-      re-measures eager vs graphs in a second session; revert the default if it does not hold
+      2.3x slower than one pass each at 16 prompts, padded 1.05x faster). On the T4: 16 prompts in 38 vs 78 ms;
+      with 64-token buckets, 3,605 -> 3,948 tok/s past capacity and median first token 2.2 -> 1.1 s
+- [x] CUDA graphs are the default for `gpt2_serve` on CUDA (`--no-cuda-graphs` to turn off). Confirmed in a
+      second session: served TPOT 5.9 -> 2.4 ms at 4 req/s (6.0 -> 2.5 on 2026-10-08)
 - [x] Streaming decode re-decoded the whole output per token (O(n^2), under a shared lock): now O(1) per token
 - [ ] Custom CUDA decode-attention kernel (needs nvcc on Kaggle), compare vs LibTorch
 - [ ] Paged KV cache (block table + allocator), best combined with the custom kernel
@@ -284,4 +293,4 @@ capacity ~50 req/s (~3200 tok/s), continuous batching -95% first-token latency v
 - [x] Dockerfile (CPU, four stages: toolchain, build + tests, weights export, runtime), `docker run` instructions
 - [ ] 2–3 min demo video: streaming under load (recorded locally on CPU) — Ujjwal
 - [x] License (MIT), TODOs cleaned up
-- [ ] Tag `v1.0` once the next Kaggle run has measured batched prefill and the 64-token buckets
+- [x] Tag `v1.0` (after the 2026-10-09 Kaggle run measured batched prefill and the 64-token buckets)

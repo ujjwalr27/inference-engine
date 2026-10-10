@@ -371,7 +371,7 @@ At 64 req/s (past capacity): engine + graphs **3,486** output tok/s with all 1,3
 
 **The harness bug behind the first vLLM run (2026-10-07).** vLLM froze 19 s into the 32 req/s run and 7 s into the 64 req/s run; every later request hung until the client's 300 s timeout (28 and 865 failures). The scripts sent server output to a pipe that nothing read. Now that logs go to files, their sizes confirm it: vLLM wrote 25, 31 and 43 KB at 4, 8 and 16 req/s, and 66 and 109 KB at 32 and 64. It froze in exactly the two runs that outgrew the ~64 KB pipe. vLLM's log has one `ERROR` line per start (FlashAttention 2 needs compute capability 8.0); it falls back to Triton attention and is otherwise healthy.
 
-**Phase 8 follow-ups (2026-10-09): batched prefill, 64-token graph buckets, graphs by default. Verified on CPU; not yet measured on a GPU.** The 2026-10-08 timing split named prefill as the largest remaining cost, so:
+**Phase 8 follow-ups (2026-10-09): batched prefill, 64-token graph buckets, graphs by default.** Verified on CPU first, then measured on the T4 (results below). The 2026-10-08 timing split named prefill as the largest remaining cost, so:
 - **Batched prefill.** The requests admitted in one step are prefilled together (§6.2) and all their first tokens come back in one device → host copy. Before, each admitted request was its own pass of ~200 kernel launches, ending in its own sync.
 
   **Packed first, then padded, decided by measurement.** The first version packed the prompts end to end in one row with a block-diagonal causal mask, so no work went to padding. But attention then runs over the whole row: n prompts of length T cost (nT)² scores instead of n·T², most of them masked out. On CPU (`gpt2_bench`, 128-token prompts, the Docker image, 3 iterations), that made packing slower than one pass per prompt. Right padding into [n, longest] costs n·longest² and matched or beat it:
@@ -394,7 +394,64 @@ On CPU, in the Docker toolchain image with the real weights, all 88 tests pass (
 
 The whole suite also runs clean under AddressSanitizer and UBSan, the stress test included (79 pass, 9 GPU tests skip). The one finding was in a test helper: `memcpy` from an empty vector's `data()`, which may be null.
 
-What the next Kaggle run measures, all in one session: `bench_fp16_graphs.csv` against `bench_fp16_graphs128.csv` for the buckets, and the `prefill_solo`/`prefill_padded`/`prefill_packed` rows for batching alone. Served, `kaggle_baseline.py --servers engine,engine_graphs,engine_full,vllm` puts eager, graphs as of 2026-10-08, and the new defaults next to vLLM. The sweep's new section 5 runs static against continuous batching with 8–128 output tokens, which the fixed-length workload could not show.
+**Phase 8 follow-up results (Kaggle T4, fp16, 2026-10-09).** One session, one build of `main` at `1c4ed09`. Same workload as before: prompts of 32–256 tokens, 64 output tokens, open-loop Poisson arrivals for 20 s, a fresh server per configuration. Data and charts in `results/2026-10-09_t4_phase9/`; regenerate the charts with `python scripts/plot_results.py readme results/2026-10-09_t4_phase9 --rate 32`.
+
+**Prefill layouts** (`gpt2_bench`, 128-token prompts, ms until every first token is on the host):
+
+| Prompts | One pass each | Padded batch | Packed row |
+|---|---|---|---|
+| 1 | 4.85 | 4.87 | 5.04 |
+| 2 | 9.69 | **5.94** | 6.08 |
+| 4 | 19.52 | **10.11** | 12.61 |
+| 8 | 38.97 | **19.27** | 30.37 |
+| 16 | 78.40 | **38.20** | 87.24 |
+
+The GPU agrees with the CPU: a padded batch halves the cost of 2–16 prompts, and packing degrades with the row length until, at 16 prompts, it is slower than one pass each.
+
+**Graph length buckets** (decode ms/step, fp16):
+
+| Cache length | Batch | Eager | Graphs, 128 buckets | Graphs, 64 buckets |
+|---|---|---|---|---|
+| 128 | 1 | 4.56 | 2.21 | **2.13** |
+| 128 | 32 | 6.06 | 4.89 | **4.31** |
+| 512 | 16 | 5.38 | 4.89 | **4.58** |
+| 512 | 32 | **6.38** | 7.84 | 7.14 |
+| 1023 | 32 | 10.26 | 10.63 | 10.35 |
+
+64-token buckets are 2–12% faster than 128 everywhere: 129 now rounds to 192 rather than 256, 513 to 576 rather than 640. They do not fully fix batch 32 at 512 tokens, where the step is attention-bound and the remaining 12% of padding costs 12% (7.14 against 6.38 eager). The served workload stays under 320 tokens and never reaches it; choosing eager decode when batch × length is large would.
+
+**Served, four servers in one session** (32 sequences in flight each):
+
+| Rate | TPOT p50: eager / graphs / full / vLLM | TTFT p50: eager / graphs / full / vLLM | TTFT p99: graphs / full |
+|---|---|---|---|
+| 4 | 5.9 / 2.4 / **2.4** / 2.7 ms | 9.3 / 7.2 / 7.6 / 20.7 ms | 21.5 / **17.8** ms |
+| 8 | 6.1 / 2.6 / **2.6** / 2.9 ms | 10.1 / 7.6 / **7.4** / 21.6 ms | 18.4 / **13.7** ms |
+| 16 | 6.6 / 3.2 / **3.1** / 3.5 ms | 10.4 / 7.9 / **7.8** / 23.4 ms | 17.6 / **15.5** ms |
+| 32 | 7.9 / 5.0 / **4.6** / 5.6 ms | 11.5 / 8.9 / **8.7** / 30.8 ms | 21.4 / **18.4** ms |
+| 64 | 9.6 / 8.8 / **8.0** / 9.2 ms | 3.5 / 2.2 / **1.1** / 3.0 s | 3.5 / **1.5** s |
+
+`engine` = no graphs, one prefill pass per request; `engine_graphs` = graphs at 128-token buckets, one pass per request (the 2026-10-08 configuration); `engine_full` = the defaults.
+
+At 64 req/s (past capacity):
+
+| | Output tok/s | Completed req/s | Turned away | Whole request p50 |
+|---|---|---|---|---|
+| engine | 3,252 | 51.0 | 60 × 429 | 4.1 s |
+| engine_graphs | 3,605 | 56.5 | 0 | 2.7 s |
+| **engine_full** | **3,948** | **61.9** | 0 | **1.6 s** |
+| vLLM | 3,351 | 52.4 | 0 | 3.6 s |
+
+- **CUDA graphs hold up in a second session:** time per token 5.9 → 2.4 ms at 4 req/s (6.0 → 2.5 on 2026-10-08). They stay the default.
+- **Batched prefill and 64-token buckets add 9.5% throughput past capacity** (3,605 → 3,948 tok/s; capacity 56.5 → 61.9 completed req/s) and halve the median first token there (2.2 → 1.1 s). The scheduler's timers split the gain: prefill took 7.0 s instead of 8.2 s (1,346 requests in 1,013 passes rather than 1,346), and decode 5.1 instead of 5.5 ms per step. Past capacity a small throughput gain shortens the queue a lot, which is why first-token latency moved far more than throughput. Below capacity the change is small: TTFT p99 2–5 ms lower, TPOT unchanged except at 32 req/s (5.0 → 4.6 ms).
+- **Against vLLM, the engine is now ahead on this workload:** 18% more throughput past capacity (3,948 against 3,351 tok/s), time per token 10–18% lower at every rate, first token 2.7–3.5× sooner below capacity. The caveats from 2026-10-08 still apply: GPT-2 small, a T4 where vLLM runs Triton attention, 32 sequences in flight, uniform 64-token outputs.
+
+**The sweep (defaults: graphs and batched prefill on).**
+- **Static batching beats continuous past capacity on this workload:** at 64 req/s, 4,152 against 3,904 tok/s, first token p50 0.48 against 1.24 s, TPOT 6.4 against 8.1 ms. On 2026-10-05, before batched prefill, the two were level (3,214 / 3,194). With every request exactly 64 tokens, a static batch never strands a slot, prefills all its requests up front and then decodes without interruption; continuous batching interleaves a small prefill pass (1.3 requests on average) between decode steps whenever a slot frees up. Below capacity continuous batching is still far better: first token 7–9 ms against 58–185 ms p50, whole requests 20–35% faster.
+- **Mixed output lengths** (`--max-tokens-min 8 --max-tokens 128`, mean 68) at 16 req/s: first token 8 against 202 ms p50 and 18 against 465 ms p99, whole requests 233 against 417 ms, throughput level (1,158 against 1,136 tok/s). The static gap is wider than with fixed lengths (137 ms p50 at 16 req/s), since a batch now runs until its longest request ends. 16 req/s is below capacity, so idle slots cannot cost static throughput there; a mixed-length run at 64 req/s is the test that can show it.
+- **Slots:** 423 / 1,344 / 2,158 / 3,060 / 3,863 tok/s for 1 / 4 / 8 / 16 / 32 slots, **9×** from 1 to 32 slots. It was 16× on 2026-10-05, because CUDA graphs doubled single-request speed (TPOT 2.3 ms), not because batching got worse.
+- **fp32 against fp16 at 16 req/s:** same throughput, but TPOT 9.2 against 3.1 ms and whole requests 601 against 204 ms. Graphs help fp16 most, so the gap widened from 8.6 against 6.6 ms.
+
+**A load-generator undercount, found in this run.** The mixed-length chart showed a minimum of 3 output tokens when 8 was the floor. The load generator counted one token per streamed event, but the server holds back a token that ends partway through a UTF-8 character and sends it with the next, so an event can carry two tokens. 0.8–1.1% of engine requests were undercounted (mean 63.6–63.8 of 64); vLLM's counts come from its usage report and were exact. The bias is against the engine (throughput understated by ~0.5%, TPOT overstated for those requests) and changes no conclusion. `gpt2_loadgen` now takes the count from the final event's `timings.output_tokens`; a CPU check counted exactly 24 for all 91 requests.
 
 **Phase 6 result (Kaggle T4, 2026-09-19): 75/75 tests pass**, including six GPU tests. The first run failed two of them; both were tolerances guessed on CPU, not engine faults (see below).
 

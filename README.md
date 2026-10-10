@@ -7,11 +7,14 @@ continuous batching, CUDA graphs, an HTTP server that streams tokens, and a load
 measure all of it. No Python at serving time and no model code from Hugging Face; the weights are
 exported once and loaded directly.
 
-On a Kaggle Tesla T4 serving GPT-2 small in fp16, it matches vLLM on the same workload. It has
-2–10% lower time per token, a 2.7–3.5× sooner first token and 5% more throughput past capacity
-([details and caveats](#how-it-compares)).
+On a Kaggle Tesla T4 serving GPT-2 small in fp16, it outpaces vLLM on the same workload:
+- 18% more throughput past capacity (3,948 vs 3,351 output tokens/s);
+- 10–18% lower time per token at every load;
+- a first token 2.7–3.5× sooner below capacity.
 
-![The engine with CUDA graphs against vLLM on a T4](results/2026-10-08_t4_graphs/engine_vs_vllm.png)
+See [details and caveats](#how-it-compares).
+
+![The engine against vLLM on a T4](results/2026-10-09_t4_phase9/engine_vs_vllm.png)
 
 ## What is inside
 
@@ -185,24 +188,27 @@ numbers use prompts of 32–256 tokens, 64 output tokens and open-loop Poisson a
 | Change | Measured effect |
 |---|---|
 | KV cache (Phase 2) | 2.9× faster per token on CPU: 157.9 → 54.3 ms/token |
-| Continuous batching instead of static | first token 95–97% sooner below capacity (9 vs 255 ms p50 at 8 req/s), whole requests 30–40% faster, same throughput |
-| 32 slots instead of 1 | 16× the throughput (200 → 3,239 tokens/s), still rising at 32 |
+| Continuous batching instead of static | first token 87–96% sooner below capacity (8 vs 102 ms p50 at 8 req/s, 8 vs 202 ms with mixed output lengths), whole requests 20–44% faster, same throughput. Past capacity, with uniform lengths, static wins (see Honest notes) |
+| 32 slots instead of 1 | 9× the throughput (423 → 3,863 tokens/s), still rising at 32; 16× before CUDA graphs made a single request twice as fast |
 | fp16 instead of fp32 | per-request latency 24% lower (427 vs 562 ms) at the same throughput; half the KV cache memory |
 | One shared tokenizer instead of one per thread | served throughput 730 → 3,239 tokens/s; capacity 11 → 50 req/s |
-| CUDA graphs | decode step 4.8 → 2.2 ms for one request; served time per token 6.0 → 2.5 ms; capacity +12% |
-| Batched prefill | on CPU, 16 prompts: 4.8 s as one padded batch vs 5.0 s one by one; packing them into one row instead took 11.4 s (attention over the whole row). GPU numbers pending |
-| 64-token graph buckets | not measured on a GPU yet (see [TODO.md](TODO.md)) |
+| CUDA graphs | decode step 4.6 → 2.1 ms for one request; served time per token 5.9 → 2.4 ms (6.0 → 2.5 in an earlier session); capacity 51 → 56.5 req/s |
+| Batched prefill + 64-token graph buckets | 16 prompts prefilled in 38 instead of 78 ms; past capacity, 3,605 → 3,948 tokens/s, capacity 56.5 → 61.9 req/s, median first token 2.2 → 1.1 s |
 
 The tokenizer row was a bug, found because the Hugging Face baseline looked too close. Each
 worker thread loaded its own copy of `tokenizer.json`, about 200 ms each. Every claim made before
 the fix was re-measured; IMPLEMENTATION.md keeps the record of what changed.
 
-Charts: [continuous vs static](results/2026-10-05_t4/continuous_vs_static.png) ·
-[latency vs load](results/2026-10-05_t4/ttft_vs_rate.png) ·
-[slots vs throughput](results/2026-10-05_t4/slots_vs_throughput.png) ·
-[decode step vs batch](results/2026-10-08_t4_graphs/decode_step_vs_batch.png) ·
-[against Hugging Face](results/2026-10-05_t4/engine_vs_huggingface.png) ·
-[against vLLM](results/2026-10-08_t4_graphs/engine_vs_vllm.png)
+Charts (2026-10-09 unless dated):
+- [continuous vs static](results/2026-10-09_t4_phase9/continuous_vs_static.png)
+- [with mixed output lengths](results/2026-10-09_t4_phase9/continuous_vs_static_varied.png)
+- [latency vs load](results/2026-10-09_t4_phase9/ttft_vs_rate.png)
+- [slots vs throughput](results/2026-10-09_t4_phase9/slots_vs_throughput.png)
+- [decode step vs batch](results/2026-10-09_t4_phase9/decode_step_vs_batch.png)
+- [prefill layouts](results/2026-10-09_t4_phase9/prefill_batching.png)
+- [batched prefill served](results/2026-10-09_t4_phase9/batched_prefill.png)
+- [against vLLM](results/2026-10-09_t4_phase9/engine_vs_vllm.png)
+- [against Hugging Face (2026-10-05)](results/2026-10-05_t4/engine_vs_huggingface.png)
 
 ## How it compares
 
@@ -211,14 +217,16 @@ Charts: [continuous vs static](results/2026-10-05_t4/continuous_vs_static.png) �
 - A first token in 7–9 ms at every load, where Hugging Face takes 16 ms idle and 37 s at 8 req/s
   once requests queue behind each other.
 
-**Against vLLM 0.31** (one session, both capped at 32 sequences in flight):
+**Against vLLM 0.31** (2026-10-09, one session, both capped at 32 sequences in flight):
 
-| Load | Time per token: engine / vLLM | First token: engine / vLLM |
-|---|---|---|
-| 4 req/s | 2.5 / 2.8 ms | 7 / 21 ms |
-| 32 req/s | 5.5 / 5.6 ms | 9 / 32 ms |
+| Load | Time per token: engine / vLLM | First token p50: engine / vLLM | Output tokens/s: engine / vLLM |
+|---|---|---|---|
+| 4 req/s | 2.4 / 2.7 ms | 8 / 21 ms | 248 / 248 (the load sets it) |
+| 32 req/s | 4.6 / 5.6 ms | 9 / 31 ms | 2,228 / 2,232 |
+| 64 req/s | 8.0 / 9.2 ms | 1.1 / 3.0 s | **3,948 / 3,351** |
 
-Past capacity, at 64 req/s, the engine produced 3,486 output tokens/s against vLLM's 3,325.
+The previous session (2026-10-08, before batched prefill) had the engine level with vLLM:
+2.5 vs 2.8 ms per token, and 3,486 vs 3,325 tokens/s past capacity.
 
 Read the vLLM comparison narrowly:
 - **The model is small.** GPT-2 small has 124M parameters, so per-step overhead dominates, which
@@ -227,9 +235,10 @@ Read the vLLM comparison narrowly:
   back to Triton attention.
 - **Both servers were capped at 32 sequences in flight,** below vLLM's default.
 - **The workload is uniform:** every request generated exactly 64 tokens.
-- **It is one session.**
+- **The sessions were Kaggle T4s.** Each server was measured once per session, though two
+  sessions agree.
 
-The fair claim is that the engine matches vLLM here, not that it beats vLLM in general.
+The fair claim is that on this setup the engine is ahead of vLLM; not that it beats vLLM in general.
 
 ## Honest notes
 
@@ -238,9 +247,15 @@ The fair claim is that the engine matches vLLM here, not that it beats vLLM in g
   below 1.0 in fp16, and below 1e-3 in fp32. Every divergence seen so far was at a gap of 0 or
   0.06.
 - **Decode on the T4 is launch-bound at small batches.** Without graphs, a step costs about 5 ms
-  for 1 request or 16. CUDA graphs fix most of that. One corner was slower with them: batch 32
-  with a 512-token cache, where 513 padded to 640. Finer buckets (64) are meant to fix it,
-  measurement pending.
+  for 1 request or 16. CUDA graphs fix most of that, but one corner stays slower with them:
+  batch 32 with a 512-token cache, 7.1 vs 6.4 ms. That step is attention-bound, and padding the
+  length to the next graph bucket (513 → 576) costs 12%. The served workload never gets there.
+- **Past capacity, static batching beat continuous batching on this workload:** 4,152 vs 3,904
+  tokens/s at 64 req/s. Every request generates exactly 64 tokens, so a static batch never strands
+  a slot. It prefills its requests up front, then decodes without interruption. Continuous
+  batching slips small prefill passes between decode steps instead. Below capacity, continuous
+  batching gives a first token 8–24× sooner. Whether mixed output lengths turn the saturated
+  result around is not measured yet.
 - **Greedy decoding only.** No sampling and no OpenAI-compatible endpoint (the load generator
   speaks OpenAI's API to drive vLLM, but the server does not).
 - **One sequence per slot.** Every slot reserves the full 1024-token context, so the slot count
