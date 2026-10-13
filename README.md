@@ -238,8 +238,6 @@ Read the vLLM comparison narrowly:
 - **The sessions were Kaggle T4s.** Each server was measured once per session, though two
   sessions agree.
 
-The fair claim is that on this setup the engine is ahead of vLLM; not that it beats vLLM in general.
-
 ## Honest notes
 
 - **fp16 occasionally changes a greedy token.** When the top two logits are within fp16 rounding
