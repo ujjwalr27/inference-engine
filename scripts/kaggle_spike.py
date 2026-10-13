@@ -2,7 +2,7 @@
 
 Paste into a Kaggle notebook cell (GPU T4, Internet on) and run. It is self-contained:
 it records the environment, writes a tiny CMake project, builds it, and runs it on CUDA.
-Copy the full output back into IMPLEMENTATION.md section 2.
+Its output records the environment the engine is built against.
 """
 import os
 import shutil

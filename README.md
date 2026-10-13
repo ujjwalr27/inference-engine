@@ -57,9 +57,6 @@ The design rules:
   all exist before the first request; per-step tensors come from LibTorch's caching allocator.
 - **Tokenization stays off the scheduler thread.** The scheduler only ever sees token IDs.
 
-[IMPLEMENTATION.md](IMPLEMENTATION.md) has the full design, the correctness contract and every
-measurement. [TODO.md](TODO.md) is the phase-by-phase log.
-
 ## Quick start with Docker (CPU)
 
 ```bash
@@ -197,7 +194,7 @@ numbers use prompts of 32–256 tokens, 64 output tokens and open-loop Poisson a
 
 The tokenizer row was a bug, found because the Hugging Face baseline looked too close. Each
 worker thread loaded its own copy of `tokenizer.json`, about 200 ms each. Every claim made before
-the fix was re-measured; IMPLEMENTATION.md keeps the record of what changed.
+the fix was re-measured.
 
 Charts (2026-10-09 unless dated):
 - [continuous vs static](results/2026-10-09_t4_phase9/continuous_vs_static.png)

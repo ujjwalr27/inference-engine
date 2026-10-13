@@ -14,3 +14,7 @@ compile_commands.json
 
 # Server logs from the Kaggle scripts: diagnostics, not results
 results/**/logs/
+
+# Planning notes, kept locally
+IMPLEMENTATION.md
+TODO.md
